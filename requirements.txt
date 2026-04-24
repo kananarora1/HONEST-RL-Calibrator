@@ -2,4 +2,7 @@ openenv-core>=0.2.1
 fastapi
 uvicorn
 pydantic
-python-constraint
+python-constraint>=1.4
+datasets>=2.21
+sympy>=1.13
+z3-solver>=4.13
