@@ -1,5 +1,7 @@
 """Answer verification with normalization."""
 
+import math
+
 
 def _normalize(s: str) -> str:
     """Normalize a string for comparison.
@@ -12,9 +14,14 @@ def _normalize(s: str) -> str:
        reduce to a plain integer string (handles "42.0" -> "42").
     """
     s = s.strip().lower().replace(",", "")
-    # Try numeric normalization
     try:
         f = float(s)
+        # Guard: inf/nan strings parse as valid floats but are not real answers
+        if not math.isfinite(f):
+            return s  # keep as-is — will fail comparison
+        # Guard: very large floats overflow int()
+        if abs(f) > 1e15:
+            return f"{f:g}"
         if f == int(f):
             return str(int(f))
         # Keep as float string but strip trailing zeros for consistency
@@ -26,4 +33,10 @@ def _normalize(s: str) -> str:
 
 def verify_answer(agent_answer: str, ground_truth: str) -> bool:
     """Return True if agent_answer matches ground_truth after normalization."""
-    return _normalize(agent_answer) == _normalize(ground_truth)
+    # Reject empty answers — they should never reach here, but be safe
+    if not agent_answer or not agent_answer.strip():
+        return False
+    try:
+        return _normalize(agent_answer) == _normalize(ground_truth)
+    except (OverflowError, ValueError):
+        return False
