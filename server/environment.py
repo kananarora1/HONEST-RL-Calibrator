@@ -135,22 +135,26 @@ class HonestEnvironment(Environment):
         # STANDARD MDP LOGIC: Handle <answer> or <abstain>
         reward_value, correctness = compute_reward(parsed, self._current_answer, difficulty)
 
-        # Record episode history
-        self._state.episode_history.append(
-            {
-                "question": self._current_question,
-                "ground_truth": self._current_answer,
-                "parsed": parsed,
-                "correct": correctness,
-                "reward": reward_value,
-                "domain": domain,
-                "difficulty": difficulty,
-                "hints_used": self._state.hints_revealed
-            }
-        )
+        # Append the single authoritative history record for this step.
+        # update_difficulty() will read it (for rolling accuracy) and must
+        # NOT append anything itself.
+        step_record: dict = {
+            "question": self._current_question,
+            "ground_truth": self._current_answer,
+            "parsed": parsed,
+            "correct": correctness,
+            "reward": reward_value,
+            "domain": domain,
+            "difficulty": difficulty,
+            "hints_used": self._state.hints_revealed,
+            "difficulty_changed": False,
+        }
+        self._state.episode_history.append(step_record)
 
         self._state.episode_step += 1
-        update_difficulty(self._state, correctness, domain=domain)
+        _, diff_changed = update_difficulty(self._state, correctness, domain=domain)
+        if diff_changed:
+            step_record["difficulty_changed"] = True
 
         terminal = self._state.episode_step >= EPISODE_LENGTH
 

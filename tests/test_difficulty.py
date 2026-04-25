@@ -26,9 +26,26 @@ def make_state(domain: str = "math", difficulty: int = 3) -> HonestState:
 
 
 def run_episodes(state: HonestState, outcomes: list, domain: str | None = None):
-    """Feed a sequence of True/False/None outcomes into update_difficulty."""
+    """Feed a sequence of True/False/None outcomes into update_difficulty.
+
+    Mirrors what HonestEnvironment.step() does: append the rich record first
+    so update_difficulty (now a pure reader) can compute rolling accuracy from
+    the current step included.
+    """
+    active_domain = domain or state.current_domain
+    diff = state.domain_difficulties.get(active_domain, 1)
     for outcome in outcomes:
-        update_difficulty(state, outcome, domain=domain)
+        record: dict = {
+            "domain": active_domain,
+            "correct": outcome,
+            "difficulty": diff,
+            "difficulty_changed": False,
+        }
+        state.episode_history.append(record)
+        new_diff, changed = update_difficulty(state, outcome, domain=active_domain)
+        if changed:
+            record["difficulty_changed"] = True
+        diff = new_diff
 
 
 # ---------------------------------------------------------------------------

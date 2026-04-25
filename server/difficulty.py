@@ -1,20 +1,18 @@
 """Adaptive difficulty management for the HONEST environment.
 
-Each episode record stored in ``state.episode_history`` is a plain dict:
+The rolling accuracy window looks at records in ``state.episode_history``
+that have a ``"domain"`` key and a ``"correct"`` key.  Those records are
+owned and written **exclusively by** ``HonestEnvironment.step()`` — this
+module is a pure analyser and mutates only ``state.domain_difficulties``.
 
-    {
-        "domain": str,          # which domain the question came from
-        "correct": bool | None, # None when answer was abstained/malformed
-        "difficulty": int,      # difficulty level at the time of the episode
-    }
-
-``update_difficulty`` inspects the last ``WINDOW`` records for the active
-domain and adjusts ``state.domain_difficulties[domain]`` according to the
-rolling-accuracy thresholds, subject to a hysteresis guard that prevents
-more than one change per ``HYSTERESIS_EPISODES`` episodes.
+``update_difficulty`` is now a **pure side-effect-free function** w.r.t.
+history: it reads history, optionally updates the difficulty scalar, and
+returns ``(new_difficulty, changed)``.  The caller (environment) is
+responsible for flagging the relevant history record with
+``"difficulty_changed": True`` if it wishes to track transitions.
 """
 
-from typing import Optional
+from typing import Optional, Tuple
 
 from models.models import HonestState
 
@@ -22,9 +20,9 @@ from models.models import HonestState
 # Constants
 # ---------------------------------------------------------------------------
 
-WINDOW: int = 20            # rolling accuracy window (episodes per domain)
+WINDOW: int = 20              # rolling accuracy window (episodes per domain)
 HIGH_THRESHOLD: float = 0.70  # accuracy above this → increase difficulty
-LOW_THRESHOLD: float = 0.30   # accuracy below this → decrease difficulty
+LOW_THRESHOLD:  float = 0.30  # accuracy below this → decrease difficulty
 MIN_DIFFICULTY: int = 1
 MAX_DIFFICULTY: int = 5
 HYSTERESIS_EPISODES: int = 10  # min episodes between consecutive changes
@@ -35,17 +33,26 @@ HYSTERESIS_EPISODES: int = 10  # min episodes between consecutive changes
 # ---------------------------------------------------------------------------
 
 def _domain_records(state: HonestState, domain: str) -> list[dict]:
-    """Return the last WINDOW episode records for *domain* from history."""
-    records = [r for r in state.episode_history if r.get("domain") == domain]
+    """Return the last WINDOW episode records for *domain* from history.
+
+    Only records that contain both 'domain' and 'correct' keys are
+    considered (i.e. the rich records written by the environment, not
+    any stale auxiliary records).
+    """
+    records = [
+        r for r in state.episode_history
+        if r.get("domain") == domain and "correct" in r
+    ]
     return records[-WINDOW:]
 
 
 def _last_change_episode(state: HonestState, domain: str) -> int:
-    """Return the global episode index of the most recent difficulty change for domain.
+    """Return the global episode index of the most recent difficulty change
+    for *domain*.
 
-    We scan episode_history backwards for a record flagged with
+    Scans ``episode_history`` backwards for a record flagged with
     ``"difficulty_changed": True`` for the given domain.
-    Returns 0 if no change has ever occurred (epoch 0 = safe to change).
+    Returns 0 if no change has ever occurred (safe to change from episode 0).
     """
     for idx in range(len(state.episode_history) - 1, -1, -1):
         r = state.episode_history[idx]
@@ -59,11 +66,11 @@ def _last_change_episode(state: HonestState, domain: str) -> int:
 # ---------------------------------------------------------------------------
 
 def get_rolling_accuracy(state: HonestState, domain: str) -> float:
-    """Return the rolling accuracy (0.0–1.0) for *domain* over the last WINDOW episodes.
+    """Return the rolling accuracy (0.0–1.0) for *domain* over the last
+    WINDOW answered episodes.
 
     Episodes where ``correct`` is ``None`` (abstain / malformed) are treated
-    as incorrect for the purpose of accuracy computation.  Returns 0.5 if
-    there are no recorded episodes for the domain yet (neutral starting point).
+    as incorrect.  Returns 0.5 (neutral) when there are no episodes yet.
     """
     records = _domain_records(state, domain)
     if not records:
@@ -76,47 +83,46 @@ def update_difficulty(
     state: HonestState,
     last_correctness: Optional[bool],
     domain: Optional[str] = None,
-) -> None:
-    """Update ``state.domain_difficulties[domain]`` based on rolling accuracy.
+) -> Tuple[int, bool]:
+    """Evaluate rolling accuracy and adjust ``state.domain_difficulties``
+    in-place if a threshold is crossed.
 
     Parameters
     ----------
     state:
-        The current environment state (mutated in-place).
+        The current environment state (mutated in-place for the difficulty
+        scalar only — history is **not** touched here).
     last_correctness:
         Whether the most recent answer was correct.  ``None`` for
         abstain / malformed answers (counted as incorrect).
     domain:
         Override for the active domain.  Defaults to ``state.current_domain``.
 
-    Side-effects
-    ------------
-    * Appends a new episode record to ``state.episode_history``.
-    * May increment or decrement ``state.domain_difficulties[domain]``.
+    Returns
+    -------
+    (new_difficulty, changed) where ``changed`` is True iff the difficulty
+    scalar was actually modified this call.  The caller can use this to
+    stamp ``"difficulty_changed": True`` onto its own history record.
     """
     if domain is None:
         domain = state.current_domain
 
     current_difficulty = state.domain_difficulties.get(domain, 1)
-    global_episode_idx = len(state.episode_history)  # index *before* append
 
-    # Build and append episode record first (so get_rolling_accuracy sees it)
-    record: dict = {
-        "domain": domain,
-        "correct": last_correctness,
-        "difficulty": current_difficulty,
-        "difficulty_changed": False,
-    }
-    state.episode_history.append(record)
+    # We need to know how many history entries exist *before* the caller
+    # appends the current step.  The caller must append its rich record
+    # *before* calling this function so rolling accuracy includes the
+    # current result.
+    global_episode_idx = len(state.episode_history) - 1  # 0-indexed last item
 
-    # --- compute rolling accuracy after appending ---
+    # --- compute rolling accuracy (includes the just-appended record) ---
     accuracy = get_rolling_accuracy(state, domain)
 
     # --- hysteresis guard ---
     last_change = _last_change_episode(state, domain)
     episodes_since_change = global_episode_idx - last_change
     if episodes_since_change < HYSTERESIS_EPISODES:
-        return  # too soon to change again
+        return current_difficulty, False  # too soon to change
 
     # --- apply threshold rules ---
     new_difficulty = current_difficulty
@@ -125,6 +131,8 @@ def update_difficulty(
     elif accuracy < LOW_THRESHOLD:
         new_difficulty = max(current_difficulty - 1, MIN_DIFFICULTY)
 
-    if new_difficulty != current_difficulty:
+    changed = new_difficulty != current_difficulty
+    if changed:
         state.domain_difficulties[domain] = new_difficulty
-        record["difficulty_changed"] = True  # flag *this* record
+
+    return new_difficulty, changed
