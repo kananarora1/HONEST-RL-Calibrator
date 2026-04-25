@@ -106,14 +106,27 @@ def build_prompt_dataset(
     """Build a *lazy* GRPO prompt dataset.
 
     The dataset stores ``n`` placeholder rows; the actual prompt, ground truth,
-    domain, difficulty and ``problem_id`` are resolved on each ``__getitem__``
-    by sampling difficulty from ``controller`` and calling the unified sampler.
-    This makes the curriculum truly adaptive: as the reward wrapper feeds
-    correctness into the controller, subsequent dataset accesses see the
-    updated target distribution.
+    domain, difficulty and ``problem_id`` are resolved on first access via
+    ``set_transform``. Resolved rows are then **cached by ``_idx``** so that
+    repeated lookups of the same index always return the *same* prompt.
 
-    Requires ``dataloader_num_workers=0`` (set in ``main()``) so the controller
-    closure runs in the trainer process and updates take effect immediately.
+    This invariant is critical for GRPO: the trainer's RepeatRandomSampler
+    requests every prompt index ``num_generations`` times in a row to obtain
+    a group of completions that share a single prompt, then computes
+    group-relative advantages over those completions. If we returned a fresh
+    prompt on every ``__getitem__`` call, every "group" would actually contain
+    ``num_generations`` *different* prompts and the GRPO advantage signal
+    would collapse.
+
+    The curriculum still adapts because there are ``n`` distinct ``_idx``
+    values (default 30,000): each *fresh* index triggers a new
+    ``controller.sample_difficulty()`` call that sees the latest curriculum
+    state. As the reward wrapper feeds correctness back into the controller,
+    later (still-unresolved) indices increasingly draw from the updated
+    target distribution.
+
+    Requires ``dataloader_num_workers=0`` (set in ``main()``) so the
+    controller closure and the resolution cache live in the trainer process.
     """
     log.info("Building lazy prompt dataset (%d placeholder rows).", n)
     placeholders = [
@@ -130,8 +143,9 @@ def build_prompt_dataset(
     ds = Dataset.from_list(placeholders)
 
     sampling_rng = random.Random(1337)
+    resolved_cache: Dict[int, dict] = {}
 
-    def _resolve_one() -> Optional[dict]:
+    def _resolve_one() -> dict:
         """Sample one (domain, difficulty) and call the unified sampler."""
         for _attempt in range(20):
             domain = sampling_rng.choice(DOMAINS)
@@ -142,7 +156,7 @@ def build_prompt_dataset(
                     seed=sampling_rng.randint(0, 2**31 - 1),
                 )
                 return {
-                    "question":     question,
+                    "prompt":       _build_prompt_text(tokenizer, question),
                     "ground_truth": str(ground_truth),
                     "difficulty":   int(difficulty),
                     "domain":       domain,
@@ -151,11 +165,10 @@ def build_prompt_dataset(
             except Exception as exc:
                 log.debug("generator(%s, d=%d) raised %s — retrying", domain, difficulty, exc)
                 continue
-        # Last resort: a trivial procedural-style row so the dataloader never starves.
         log.warning("Generator retries exhausted; emitting a fallback math problem.")
         question, gt, pid = math_generate(1, seed=sampling_rng.randint(0, 2**31 - 1))
         return {
-            "question":     question,
+            "prompt":       _build_prompt_text(tokenizer, question),
             "ground_truth": str(gt),
             "difficulty":   1,
             "domain":       "math",
@@ -163,17 +176,18 @@ def build_prompt_dataset(
         }
 
     def _transform(batch: Dict[str, list]) -> Dict[str, list]:
-        n_in = len(batch["_idx"])
+        idx_list = list(batch["_idx"])
         out_prompt:   List[str] = []
         out_gt:       List[str] = []
         out_diff:     List[int] = []
         out_domain:   List[str] = []
         out_pid:      List[str] = []
-        for _ in range(n_in):
-            row = _resolve_one()
+        for idx in idx_list:
+            row = resolved_cache.get(int(idx))
             if row is None:
-                continue
-            out_prompt.append(_build_prompt_text(tokenizer, row["question"]))
+                row = _resolve_one()
+                resolved_cache[int(idx)] = row
+            out_prompt.append(row["prompt"])
             out_gt.append(row["ground_truth"])
             out_diff.append(row["difficulty"])
             out_domain.append(row["domain"])
@@ -184,10 +198,11 @@ def build_prompt_dataset(
             "difficulty":   out_diff,
             "domain":       out_domain,
             "problem_id":   out_pid,
-            "_idx":         list(batch["_idx"]),
+            "_idx":         idx_list,
         }
 
     ds.set_transform(_transform)
+    ds._honest_resolved_cache = resolved_cache  # exposed for tests/inspection
     return ds
 
 
