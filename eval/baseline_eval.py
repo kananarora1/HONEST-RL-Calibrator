@@ -116,7 +116,7 @@ def generate_response(
     model,
     tokenizer,
     question: str,
-    max_new_tokens: int = 128,
+    max_new_tokens: int = 2048,
 ) -> str:
     """Run one inference pass using the chat template."""
     import torch
