@@ -10,33 +10,36 @@ _ANSWER_RE = re.compile(
     r"<reasoning>(.*?)</reasoning>\s*<answer>(.*?)</answer>\s*<confidence>(.*?)</confidence>",
     re.DOTALL | re.IGNORECASE,
 )
-_ABSTAIN_RE = re.compile(r"<abstain\s*/>", re.IGNORECASE)
 
-MALFORMED_PENALTY = -0.20
-ABSTAIN_PENALTY   = -0.10
-FORMAT_BONUS      = 0.05
+MALFORMED_PENALTY = -1.0
+ABSTAIN_PENALTY   = 0.0
+HINT_PENALTY      = -0.25
+FORMAT_BONUS      = 0.15
 
 
 def parse_action(raw_text: str) -> dict:
-    # Try hint first
     if re.search(r'<request_hint\s*/?>', raw_text):
         return {"type": "hint"}
         
-    # Try abstain
     if re.search(r'<abstain\s*/?>', raw_text):
         return {"type": "abstain"}
         
-    # Try answer + confidence
-    answer_match = re.search(r'<answer>(.*?)</answer>', raw_text, re.DOTALL)
-    conf_match = re.search(r'<confidence>([-?\d.]+)</confidence>', raw_text)
-    
-    if answer_match and conf_match:
+    m = _ANSWER_RE.search(raw_text)
+    if m:
+        reasoning_str = m.group(1).strip()
+        answer_str    = m.group(2).strip()
+        conf_str      = m.group(3).strip()
+        
+        # Require both reasoning and answer to prevent "Reasoning Bypass" cheat
+        if not answer_str or not reasoning_str:
+            return {"type": "malformed"}
+            
         try:
-            confidence = float(conf_match.group(1))
+            confidence = float(conf_str)
             confidence = max(0.0, min(1.0, confidence)) # Clamp
             return {
                 "type": "answer",
-                "answer": answer_match.group(1).strip(),
+                "answer": answer_str,
                 "confidence": confidence
             }
         except ValueError:
@@ -45,30 +48,44 @@ def parse_action(raw_text: str) -> dict:
     return {"type": "malformed"}
 
 
+def _verify(
+    model_answer: str,
+    ground_truth: str,
+    problem_id: Optional[str],
+    domain: Optional[str],
+    verification_metadata: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Route to the domain-aware verifier."""
+    if problem_id and problem_id.startswith("procedural_"):
+        return verify_answer(model_answer, ground_truth, domain=None, verification_metadata=verification_metadata)
+
+    if problem_id:
+        try:
+            from data.sampler.unified_sampler import get_sampler
+            return get_sampler().verify(problem_id, model_answer)
+        except Exception:
+            pass
+    return verify_answer(model_answer, ground_truth, domain=domain, verification_metadata=verification_metadata)
+
+
 def compute_reward(
     parsed: dict,
     ground_truth: str,
     difficulty: int,
+    problem_id: Optional[str] = None,
     domain: Optional[str] = None,
     verification_metadata: Optional[Dict[str, Any]] = None,
 ) -> Tuple[float, Optional[bool]]:
     """
     Compute (reward, correctness_or_None) from a parsed action.
-
-    Reward scheme:
-    - malformed                 : (-0.20, None)
-    - abstain, difficulty >= 7  : ( 0.00, None)
-    - abstain, difficulty <  7  : (-0.10, None)
-    - answer                    : (dampened_brier_score + format_bonus, correct)
-
-    Dampened Brier score component:
-        brier = -0.5 * ((confidence - target) ** 2)
-    where target = 1.0 if correct else 0.0.
     """
     action_type = parsed.get("type")
 
     if action_type == "malformed":
         return (MALFORMED_PENALTY, None)
+
+    if action_type == "hint":
+        return (HINT_PENALTY, None)
 
     if action_type == "abstain":
         if difficulty >= 7:
@@ -77,20 +94,19 @@ def compute_reward(
 
     if action_type == "answer":
         try:
-            correct = verify_answer(
+            correct = _verify(
                 parsed["answer"],
                 ground_truth,
-                domain=domain,
-                verification_metadata=verification_metadata,
+                problem_id,
+                domain,
+                verification_metadata,
             )
         except Exception:
-            # Defensive: treat any verifier exception as an incorrect answer
             correct = False
             
         target = 1.0 if correct else 0.0
         
-        # Scale Brier penalty by 0.5 to keep gradients stable
-        brier = -0.5 * ((parsed["confidence"] - target) ** 2)
+        brier = -1.5 * ((parsed["confidence"] - target) ** 2)
         reward = brier + FORMAT_BONUS
         
         return (reward, correct)
@@ -101,11 +117,10 @@ def compute_reward(
 """
 Multi-reward functions for TRL GRPOTrainer.
 
-Smoothed Magnitude budget (Total bounds ~ [-0.52, +0.20]):
-  reward_brier      [-0.45, +0.05]  Primary calibration signal (dampened)
-  reward_format     [ 0.00, +0.05]  Early-training compliance bonus
-  reward_accuracy   [ 0.00, +0.10]  Correctness encouragement
-  reward_anti_hedge [-0.07,  0.00]  Prevents always-0.5 collapse
+Smoothed Magnitude budget (Total bounds ~ [-1.50, +1.00]):
+  reward_brier      [-1.50, +0.15]  Primary calibration signal (dampened)
+  reward_format     [ 0.00, +0.15]  Early-training compliance bonus
+  reward_accuracy   [-0.15, +0.85]  Correctness bonus / Incorrect penalty
 """
 
 def reward_brier(
@@ -116,23 +131,23 @@ def reward_brier(
     **kwargs,
 ) -> List[float]:
     rewards = []
-    domains = kwargs.get("domain")
-    verification_metadatas = kwargs.get("verification_metadata")
+    pid_list = kwargs.get("problem_id", [None] * len(completions))
+    domains = kwargs.get("domain", [None] * len(completions))
+    verification_metadatas = kwargs.get("verification_metadata", [{}] * len(completions))
 
     for idx, (comp, gt, diff) in enumerate(zip(completions, ground_truth, difficulty)):
         domain = domains[idx] if isinstance(domains, list) and idx < len(domains) else None
-        verification_metadata = (
-            verification_metadatas[idx]
-            if isinstance(verification_metadatas, list) and idx < len(verification_metadatas)
-            else None
-        )
+        pid = pid_list[idx] if isinstance(pid_list, list) and idx < len(pid_list) else None
+        v_meta = verification_metadatas[idx] if isinstance(verification_metadatas, list) and idx < len(verification_metadatas) else None
+        
         parsed = parse_action(comp)
         r, _ = compute_reward(
             parsed,
             str(gt),
             int(diff),
+            problem_id=pid,
             domain=domain,
-            verification_metadata=verification_metadata,
+            verification_metadata=v_meta,
         )
         rewards.append(float(r))
     return rewards
@@ -142,12 +157,12 @@ def reward_format(
     completions: List[str],
     **kwargs,
 ) -> List[float]:
-    """Format compliance reward: +0.05 for well-formed output, 0.0 otherwise."""
+    """Format compliance reward: +0.15 for well-formed output, 0.0 otherwise."""
     rewards = []
     for comp in completions:
         parsed = parse_action(comp)
-        if parsed["type"] in ("answer", "abstain"):
-            rewards.append(0.05)
+        if parsed["type"] in ("answer", "abstain", "hint"):
+            rewards.append(0.15)
         else:
             rewards.append(0.0)
     return rewards
@@ -159,31 +174,26 @@ def reward_accuracy(
     ground_truth: List[str],
     **kwargs,
 ) -> List[float]:
-    """Correctness bonus: +0.10 if the answer is correct, 0.0 otherwise."""
+    """Correctness bonus: +0.85 if correct, -0.15 if incorrect."""
     rewards = []
-    for comp, gt in zip(completions, ground_truth):
+    pid_list = kwargs.get("problem_id", [None] * len(completions))
+    domains = kwargs.get("domain", [None] * len(completions))
+    verification_metadatas = kwargs.get("verification_metadata", [{}] * len(completions))
+    
+    for idx, (comp, gt) in enumerate(zip(completions, ground_truth)):
+        domain = domains[idx] if isinstance(domains, list) and idx < len(domains) else None
+        pid = pid_list[idx] if isinstance(pid_list, list) and idx < len(pid_list) else None
+        v_meta = verification_metadatas[idx] if isinstance(verification_metadatas, list) and idx < len(verification_metadatas) else None
+
         parsed = parse_action(comp)
         if parsed["type"] == "answer":
             try:
-                correct = verify_answer(parsed["answer"], str(gt))
+                correct = _verify(parsed["answer"], str(gt), pid, domain, v_meta)
             except Exception:
                 correct = False
-            rewards.append(0.10 if correct else 0.0)
+            rewards.append(0.85 if correct else -0.15)
         else:
             rewards.append(0.0)
     return rewards
 
-
-def reward_anti_hedge(
-    completions: List[str],
-    **kwargs,
-) -> List[float]:
-    """Anti-hedging penalty: -0.07 when confidence is in [0.45, 0.55]."""
-    rewards = []
-    for comp in completions:
-        parsed = parse_action(comp)
-        if parsed["type"] == "answer" and 0.45 <= parsed["confidence"] <= 0.55:
-            rewards.append(-0.07)
-        else:
-            rewards.append(0.0)
-    return rewards
+# NOTE: reward_anti_hedge has been DELETED to prevent the 0.7 confidence exploit.
