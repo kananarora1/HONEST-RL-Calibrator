@@ -7,3 +7,15 @@ datasets>=2.21
 sympy>=1.13
 z3-solver>=4.13
 antlr4-python3-runtime>=4.11
+
+# RL Training Dependencies
+torch
+transformers
+trl
+peft
+accelerate
+bitsandbytes
+deepspeed
+wandb
+numpy
+unsloth

@@ -30,8 +30,7 @@ from client.client import HonestEnv
 from server.reward import (
     reward_brier,
     reward_format,
-    # reward_accuracy,   # Commented out to prevent reward dilution
-    # reward_anti_hedge, # Commented out to prevent reward dilution
+    reward_accuracy,
 )
 
 logging.basicConfig(
@@ -342,7 +341,7 @@ def main():
         model=model,
         # The environment_factory handles the core Brier score reward natively from the server.
         # `reward_format` acts as a local auxiliary penalty to strictly enforce XML structure.
-        reward_funcs=[reward_format] if env_url else [logged_brier, reward_format],
+        reward_funcs=[reward_format, reward_accuracy] if env_url else [logged_brier, reward_format, reward_accuracy],
         args=grpo_config,
         train_dataset=train_dataset,
         processing_class=tokenizer,
