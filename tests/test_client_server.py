@@ -91,7 +91,7 @@ async def client(server_process) -> AsyncGenerator[HonestEnv, None]:
 # Helper
 # ---------------------------------------------------------------------------
 
-WELL_FORMED = "<answer>42</answer><confidence>0.5</confidence>"
+WELL_FORMED = "<reasoning>think</reasoning><answer>42</answer><confidence>0.5</confidence>"
 MALFORMED = "no tags at all"
 
 
@@ -135,7 +135,8 @@ async def test_step_with_malformed_action_gives_minus_half(client: HonestEnv):
     await client.reset()
     action = HonestAction(raw_text=MALFORMED)
     result = await client.step(action)
-    assert result.reward == pytest.approx(-0.20)
+    from server.reward import MALFORMED_PENALTY
+    assert result.reward == pytest.approx(MALFORMED_PENALTY)
 
 
 @pytest.mark.asyncio

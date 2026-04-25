@@ -46,7 +46,11 @@ SYSTEM_PROMPT = """\
 You are a precise and well-calibrated AI assistant.
 
 When answering questions, you MUST respond in EXACTLY this format:
-<answer>YOUR_ANSWER_HERE</answer><confidence>0.X</confidence>
+<reasoning>
+Briefly think step-by-step to solve the problem.
+</reasoning>
+<answer>YOUR_ANSWER_HERE</answer>
+<confidence>0.X</confidence>
 
 Where:
 - YOUR_ANSWER_HERE is your best answer to the question
@@ -59,16 +63,9 @@ Rules:
 - If you are very unsure, use <abstain/> instead
 - Never include explanations outside the XML tags
 - For numeric answers, give the number only (no units unless asked)
-- For string answers, give the exact value only
+- For string answers, give the exact value only"""
 
-Example responses:
-<answer>42</answer><confidence>0.9</confidence>
-<answer>Paris</answer><confidence>0.8</confidence>
-<abstain/>"""
-
-USER_TEMPLATE = """{question}
-
-Respond only with the XML format specified."""
+USER_TEMPLATE = "{question}\n\nThink step-by-step in the <reasoning> block, then provide your final answer and confidence."
 
 
 # ---------------------------------------------------------------------------
@@ -80,20 +77,32 @@ def load_model(model_id: str, device: str):
     try:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
+        from peft import PeftModel
     except ImportError:
-        print("ERROR: Install with: pip install transformers accelerate torch")
+        print("ERROR: Install with: pip install transformers accelerate torch peft")
         sys.exit(1)
+
+    # Check if the path is a LoRA adapter
+    is_peft = os.path.exists(os.path.join(model_id, "adapter_config.json"))
+    
+    # If it is a peft adapter, we must load the base model first
+    base_model_id = "Qwen/Qwen2.5-3B-Instruct" if is_peft else model_id
 
     print(f"Loading tokenizer: {model_id} ...")
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 
-    print(f"Loading model: {model_id} (device={device}) ...")
+    print(f"Loading base model: {base_model_id} (device={device}) ...")
     model = AutoModelForCausalLM.from_pretrained(
-        model_id,
+        base_model_id,
         torch_dtype="auto",
         device_map=device,
         trust_remote_code=True,
     )
+    
+    if is_peft:
+        print(f"Applying LoRA adapter from: {model_id} ...")
+        model = PeftModel.from_pretrained(model, model_id)
+        
     model.eval()
     print("Model loaded.\n")
     return model, tokenizer
@@ -107,7 +116,7 @@ def generate_response(
     model,
     tokenizer,
     question: str,
-    max_new_tokens: int = 128,
+    max_new_tokens: int = 2048,
 ) -> str:
     """Run one inference pass using the chat template."""
     import torch

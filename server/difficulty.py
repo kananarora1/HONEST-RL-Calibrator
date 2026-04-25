@@ -12,7 +12,10 @@ responsible for flagging the relevant history record with
 ``"difficulty_changed": True`` if it wishes to track transitions.
 """
 
-from typing import Optional, Tuple
+import random
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 
 from models.models import HonestState
 
@@ -26,6 +29,168 @@ LOW_THRESHOLD:  float = 0.30  # accuracy below this → decrease difficulty
 MIN_DIFFICULTY: int = 1
 MAX_DIFFICULTY: int = 5
 HYSTERESIS_EPISODES: int = 10  # min episodes between consecutive changes
+
+
+# ---------------------------------------------------------------------------
+# Adaptive sampling distribution: static floor + triangular overlay
+# ---------------------------------------------------------------------------
+
+# Always-on weight per difficulty 1..5 — protects against catastrophic
+# forgetting of easy-problem competence as the curriculum advances.
+STATIC_FLOOR: List[float] = [0.20, 0.15, 0.10, 0.05, 0.00]  # sums to 0.50
+
+# Remaining weight (0.50) is distributed by a triangular kernel around
+# the controller's current target_difficulty.
+ADAPTIVE_BUDGET: float = 0.50
+
+
+def triangular_overlay(target: int, total_weight: float = ADAPTIVE_BUDGET) -> List[float]:
+    """Triangular distribution centered at ``target``, summing to ``total_weight``.
+
+    Difficulties are 1-indexed; returns a 5-element list.
+    Kernel: ``max(0, 3 - |target - d|)`` over d in [1..5], then renormalised
+    to ``total_weight``.  At the edges (target=1 or target=5) the kernel is
+    clipped, so less mass lands on phantom out-of-range difficulties — but
+    the surviving mass is still renormalised so the overlay always sums to
+    ``total_weight``.
+    """
+    raw = [max(0, 3 - abs(target - d)) for d in range(1, 6)]
+    s = sum(raw)
+    if s == 0:
+        return [0.0] * 5
+    return [r * total_weight / s for r in raw]
+
+
+def compute_distribution(target_difficulty: int) -> List[float]:
+    """Static floor + adaptive overlay.  Returns weights for difficulties 1..5.
+
+    The result is renormalised to sum to exactly 1.0 to absorb floating-point
+    drift, so callers can pass it directly to ``random.choices`` weights.
+    """
+    overlay = triangular_overlay(target_difficulty)
+    distribution = [STATIC_FLOOR[i] + overlay[i] for i in range(5)]
+    total = sum(distribution)
+    return [d / total for d in distribution]
+
+
+# ---------------------------------------------------------------------------
+# DomainState + DifficultyController
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class DomainState:
+    """Per-domain state held by ``DifficultyController``."""
+    target_difficulty: int = 1
+    rolling_window: deque = field(default_factory=lambda: deque(maxlen=20))
+    episodes_since_last_update: int = 0
+
+
+class DifficultyController:
+    """Adaptive difficulty controller with a static floor.
+
+    Per-domain state: rolling 20-episode accuracy window, a target difficulty
+    scalar, and a cooldown counter.  Hysteresis thresholds 75 / 25, cooldown
+    of 10 outcomes per domain.
+
+    Lifetime: one instance per ``HonestEnvironment`` (or one per training
+    process for the local-rollout path).  The controller persists across
+    episode boundaries — its state is *not* reset by ``env.reset()``.
+    """
+
+    UPDATE_THRESHOLD_UP: float = 0.75
+    UPDATE_THRESHOLD_DOWN: float = 0.25
+    COOLDOWN_EPISODES: int = 10
+    WINDOW_SIZE: int = 20
+    DIFFICULTY_MIN: int = MIN_DIFFICULTY
+    DIFFICULTY_MAX: int = MAX_DIFFICULTY
+
+    def __init__(self, domains: List[str], initial_target: int = 1) -> None:
+        self.domains = list(domains)
+        self.state: Dict[str, DomainState] = {
+            d: DomainState(target_difficulty=initial_target) for d in self.domains
+        }
+
+    # --- sampling ----------------------------------------------------------
+
+    def sample_difficulty(
+        self,
+        domain: str,
+        rng: Optional[random.Random] = None,
+    ) -> int:
+        """Sample a difficulty 1..5 for ``domain`` using the current distribution."""
+        target = self.state[domain].target_difficulty
+        weights = compute_distribution(target)
+        chooser = rng if rng is not None else random
+        return chooser.choices([1, 2, 3, 4, 5], weights=weights, k=1)[0]
+
+    # --- outcome tracking --------------------------------------------------
+
+    def record_outcome(self, domain: str, correct: bool) -> Tuple[int, bool]:
+        """Record an episode outcome.
+
+        Returns ``(new_target_difficulty, did_update)``.  Should be called
+        only with True/False — abstain / malformed (correct=None) episodes
+        must NOT enter the rolling window.
+        """
+        s = self.state[domain]
+        s.rolling_window.append(1 if correct else 0)
+        s.episodes_since_last_update += 1
+
+        did_update = False
+        if (
+            s.episodes_since_last_update >= self.COOLDOWN_EPISODES
+            and len(s.rolling_window) >= self.WINDOW_SIZE
+        ):
+            accuracy = sum(s.rolling_window) / len(s.rolling_window)
+
+            if (
+                accuracy >= self.UPDATE_THRESHOLD_UP
+                and s.target_difficulty < self.DIFFICULTY_MAX
+            ):
+                s.target_difficulty += 1
+                did_update = True
+            elif (
+                accuracy <= self.UPDATE_THRESHOLD_DOWN
+                and s.target_difficulty > self.DIFFICULTY_MIN
+            ):
+                s.target_difficulty -= 1
+                did_update = True
+
+            if did_update:
+                # Reset the cooldown but keep the rolling window — the new
+                # target's accuracy estimate phases in as fresh outcomes flow.
+                s.episodes_since_last_update = 0
+
+        return s.target_difficulty, did_update
+
+    # --- introspection -----------------------------------------------------
+
+    def get_distribution(self, domain: str) -> List[float]:
+        return compute_distribution(self.state[domain].target_difficulty)
+
+    def get_target(self, domain: str) -> int:
+        return self.state[domain].target_difficulty
+
+    def get_rolling_accuracy(self, domain: str) -> Optional[float]:
+        s = self.state[domain]
+        if len(s.rolling_window) == 0:
+            return None
+        return sum(s.rolling_window) / len(s.rolling_window)
+
+    def snapshot(self) -> Dict[str, dict]:
+        """Return a JSON-serialisable snapshot for logging / debugging."""
+        return {
+            d: {
+                "target_difficulty": s.target_difficulty,
+                "rolling_accuracy": self.get_rolling_accuracy(d),
+                "episodes_since_update": s.episodes_since_last_update,
+                "window_full": len(s.rolling_window) == self.WINDOW_SIZE,
+                "window_size": len(s.rolling_window),
+                "distribution": self.get_distribution(d),
+            }
+            for d, s in self.state.items()
+        }
 
 
 # ---------------------------------------------------------------------------

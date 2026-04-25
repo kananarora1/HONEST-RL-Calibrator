@@ -7,7 +7,7 @@ from typing import Any, Optional
 
 from models.models import HonestAction, HonestObservation, HonestState
 from openenv.core.env_server.interfaces import Environment
-from server.difficulty import update_difficulty
+from server.difficulty import DifficultyController, update_difficulty
 from server.generators import code_gen, logic_gen, math_gen
 from server.reward import compute_reward, parse_action
 
@@ -38,6 +38,8 @@ class HonestEnvironment(Environment):
             "code": code_gen.generate,
             "logic": logic_gen.generate,
         }
+        # Adaptive difficulty controller — persists across reset() calls.
+        self.difficulty_controller = DifficultyController(domains=list(DOMAINS))
         self._current_question: Optional[str] = None
         self._current_answer: Optional[str] = None
 
@@ -65,7 +67,11 @@ class HonestEnvironment(Environment):
         domain = rng.choice(DOMAINS)
         self._state.current_domain = domain
 
-        difficulty = self._state.domain_difficulties[domain]
+        # Pull the difficulty for this episode from the adaptive controller.
+        # Snapshot the chosen value back into state so the rest of the env
+        # (reward, history, observation) reads a consistent scalar.
+        difficulty = self.difficulty_controller.sample_difficulty(domain, rng=rng)
+        self._state.domain_difficulties[domain] = difficulty
         question, answer = self._generators[domain](difficulty, seed=seed)
         self._current_question = question
         self._current_answer = answer
@@ -157,14 +163,29 @@ class HonestEnvironment(Environment):
         self._state.episode_history.append(step_record)
 
         self._state.episode_step += 1
+
+        # Legacy per-episode scalar update (still consumed by some tests).
         difficulty_update = update_difficulty(self._state, correctness, domain=domain)
-        # Tests may patch update_difficulty without a tuple return value.
         if isinstance(difficulty_update, tuple) and len(difficulty_update) >= 2:
             diff_changed = bool(difficulty_update[1])
         else:
             diff_changed = False
         if diff_changed:
             step_record["difficulty_changed"] = True
+
+        # Adaptive controller — only record real Answer outcomes (skip
+        # abstain / hint / malformed so they do not pollute the window).
+        if correctness is not None:
+            new_target, controller_changed = self.difficulty_controller.record_outcome(
+                domain, bool(correctness)
+            )
+            if controller_changed:
+                logger.info(
+                    "Difficulty controller: %s target now %d (rolling acc %.2f)",
+                    domain,
+                    new_target,
+                    self.difficulty_controller.get_rolling_accuracy(domain) or 0.0,
+                )
 
         terminal = self._state.episode_step >= EPISODE_LENGTH
 
@@ -191,10 +212,11 @@ class HonestEnvironment(Environment):
                 reward=reward_value,
             )
 
-        # Pick next problem
+        # Pick next problem — domain uniformly random; difficulty from controller.
         next_domain = random.choice(DOMAINS)
         self._state.current_domain = next_domain
-        next_difficulty = self._state.domain_difficulties[next_domain]
+        next_difficulty = self.difficulty_controller.sample_difficulty(next_domain)
+        self._state.domain_difficulties[next_domain] = next_difficulty
         next_question, next_answer = self._generators[next_domain](next_difficulty)
         
         self._current_question = next_question

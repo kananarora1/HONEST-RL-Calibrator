@@ -6,7 +6,7 @@ python-constraint>=1.4
 datasets>=2.21
 sympy>=1.13
 z3-solver>=4.13
-antlr4-python3-runtime>=4.11
+antlr4-python3-runtime==4.11
 
 # RL Training Dependencies
 torch

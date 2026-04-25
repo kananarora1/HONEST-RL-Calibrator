@@ -27,6 +27,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from server.generators import code_gen, logic_gen, math_gen
 from client.client import HonestEnv
+from server.difficulty import DifficultyController
 from server.reward import (
     reward_brier,
     reward_format,
@@ -76,27 +77,39 @@ Rules:
 USER_TEMPLATE = "{question}\n\nThink step-by-step in the <reasoning> block, then provide your final answer and confidence."
 
 
-def build_prompt_dataset(n: int, tokenizer) -> list:
+def build_prompt_dataset(
+    n: int,
+    tokenizer,
+    controller: "DifficultyController" = None,
+) -> list:
+    """Build the GRPO prompt dataset.
+
+    Difficulty is sampled from ``controller`` (static floor + adaptive overlay
+    around each domain's current target_difficulty).  At dataset-build time
+    every domain's target is still the initial value, so sampling is
+    effectively the static-floor distribution centred at 1; the controller
+    can be re-used at training time to track outcomes and update targets if
+    the trainer is later wired to record correctness back into it.
+    """
     log.info(f"Building prompt dataset ({n} prompts)...")
     rng = random.Random(1337)
     domain_list = list(GENERATORS.keys())
+    if controller is None:
+        controller = DifficultyController(domains=domain_list)
     records = []
     attempts = 0
-    
-    diff_weights = [0.40, 0.30, 0.15, 0.10, 0.05] 
-    diff_choices = [1, 2, 3, 4, 5]
 
     while len(records) < n and attempts < n * 5:
         attempts += 1
         domain = rng.choice(domain_list)
-        difficulty = rng.choices(diff_choices, weights=diff_weights, k=1)[0]
+        difficulty = controller.sample_difficulty(domain, rng=rng)
         seed = 500_000 + attempts
-        
+
         try:
             question, ground_truth = GENERATORS[domain](difficulty, seed=seed)
         except Exception:
             continue
-            
+
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user",   "content": USER_TEMPLATE.format(question=question)},
@@ -104,14 +117,14 @@ def build_prompt_dataset(n: int, tokenizer) -> list:
         prompt_text = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
-        
+
         records.append({
             "prompt":       prompt_text,
             "ground_truth": str(ground_truth),
             "difficulty":   difficulty,
             "domain":       domain,
         })
-        
+
     log.info(f"  -> {len(records)} prompts ready ({attempts} attempts).")
     return records
 
@@ -213,7 +226,7 @@ class KLEarlyStopCallback(TrainerCallback):
     def on_log(self, args, state, control, logs=None, **kwargs):
         if logs is None:
             return
-            
+
         kl = logs.get("kl") or logs.get("objective/kl")
         if kl is not None:
             if kl > self.kl_threshold:
@@ -227,6 +240,27 @@ class KLEarlyStopCallback(TrainerCallback):
                     control.should_training_stop = True
             else:
                 self._counter = 0
+
+
+class DifficultyControllerLogCallback(TrainerCallback):
+    """Emit DifficultyController snapshot to TRL logs (and thus to wandb)."""
+
+    def __init__(self, controller: "DifficultyController"):
+        self.controller = controller
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs is None:
+            return
+        snapshot = self.controller.snapshot()
+        for domain, s in snapshot.items():
+            logs[f"difficulty/{domain}/target"] = s["target_difficulty"]
+            logs[f"difficulty/{domain}/rolling_acc"] = (
+                s["rolling_accuracy"] if s["rolling_accuracy"] is not None else 0.0
+            )
+            dist = s["distribution"]
+            logs[f"difficulty/{domain}/dist_d1"] = dist[0]
+            logs[f"difficulty/{domain}/dist_d3"] = dist[2]
+            logs[f"difficulty/{domain}/dist_d5"] = dist[4]
 
 
 def main():
@@ -300,7 +334,13 @@ def main():
     else:
         model, tokenizer = load_model_standard(hf_token, args.model_id)
 
-    raw_records   = build_prompt_dataset(args.prompt_dataset_size, tokenizer)
+    # One controller shared between prompt-build sampling and the wandb
+    # logging callback, so the dashboard reflects the same instance the
+    # dataset is being drawn from.
+    difficulty_controller = DifficultyController(domains=list(GENERATORS.keys()))
+    raw_records   = build_prompt_dataset(
+        args.prompt_dataset_size, tokenizer, controller=difficulty_controller
+    )
     train_dataset = Dataset.from_list(raw_records)
     bf16 = _is_bfloat16_supported()
 
@@ -344,7 +384,10 @@ def main():
         args=grpo_config,
         train_dataset=train_dataset,
         processing_class=tokenizer,
-        callbacks=[KLEarlyStopCallback(kl_threshold=0.5, patience=20)],
+        callbacks=[
+            KLEarlyStopCallback(kl_threshold=0.5, patience=20),
+            DifficultyControllerLogCallback(difficulty_controller),
+        ],
     )
 
     log.info("=" * 60)

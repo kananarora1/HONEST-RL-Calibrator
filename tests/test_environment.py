@@ -25,7 +25,7 @@ def fresh_env(env: HonestEnvironment) -> HonestEnvironment:
     return env
 
 
-WELL_FORMED = "<answer>42</answer><confidence>0.5</confidence>"
+WELL_FORMED = "<reasoning>think</reasoning><answer>42</answer><confidence>0.5</confidence>"
 MALFORMED = "I dunno lol"
 
 
@@ -47,9 +47,11 @@ class TestReset:
         obs = env.reset()
         assert obs.domain in {"math", "code", "logic"}
 
-    def test_observation_difficulty_starts_at_1(self, env):
+    def test_observation_difficulty_in_valid_range(self, env):
         obs = env.reset()
-        assert obs.difficulty == 1
+        # The DifficultyController samples from a static-floor + adaptive-overlay
+        # distribution at reset time, so difficulty is no longer fixed at 1.
+        assert obs.difficulty in {1, 2, 3, 4, 5}
 
     def test_observation_episode_step_is_zero(self, env):
         obs = env.reset()
@@ -74,7 +76,18 @@ class TestReset:
 
     def test_reset_initialises_domain_difficulties(self, env):
         env.reset()
-        assert env.state.domain_difficulties == INITIAL_DIFFICULTIES
+        # reset() now seeds domain_difficulties from INITIAL_DIFFICULTIES and
+        # then overwrites the *current* domain's entry with a freshly sampled
+        # difficulty from the DifficultyController.  The remaining domains
+        # should still match the initial values.
+        diffs = env.state.domain_difficulties
+        assert set(diffs.keys()) == set(INITIAL_DIFFICULTIES.keys())
+        for d, v in diffs.items():
+            assert v in {1, 2, 3, 4, 5}, f"{d}: difficulty {v} out of range"
+        # Non-current domains untouched.
+        for d in INITIAL_DIFFICULTIES:
+            if d != env.state.current_domain:
+                assert diffs[d] == INITIAL_DIFFICULTIES[d]
 
     def test_seeded_reset_is_reproducible(self, env):
         obs1 = env.reset(seed=7)
@@ -101,7 +114,9 @@ class TestStep:
 
     def test_malformed_reward_is_minus_half(self, fresh_env):
         obs = fresh_env.step(HonestAction(raw_text=MALFORMED))
-        assert obs.reward == pytest.approx(-0.20)
+        # MALFORMED_PENALTY in server/reward.py
+        from server.reward import MALFORMED_PENALTY
+        assert obs.reward == pytest.approx(MALFORMED_PENALTY)
 
     def test_malformed_returns_no_correctness(self, fresh_env):
         fresh_env.step(HonestAction(raw_text=MALFORMED))
