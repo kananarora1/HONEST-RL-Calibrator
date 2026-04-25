@@ -46,33 +46,22 @@ def test_invalid_difficulty_raises():
 
 
 def test_level_1_correctness():
-    pattern = re.compile(r"(-?\d+) \+ (-?\d+)")
+    pattern = re.compile(r"(-?\d+) ([+\-]) (-?\d+)")
     for s in range(100):
         q, a = generate(1, seed=s)
         m = pattern.fullmatch(q)
         assert m, f"unexpected level-1 format: {q!r}"
-        x, y = int(m.group(1)), int(m.group(2))
-        expected = x + y
-        assert int(a) == expected, f"{q} → got {a}, expected {expected}"
-
-
-def test_level_2_correctness():
-    pattern = re.compile(r"(-?\d+) ([+\-]) (-?\d+)")
-    for s in range(100):
-        q, a = generate(2, seed=s)
-        m = pattern.fullmatch(q)
-        assert m, f"unexpected level-2 format: {q!r}"
         x, op, y = int(m.group(1)), m.group(2), int(m.group(3))
         expected = x + y if op == "+" else x - y
         assert int(a) == expected, f"{q} → got {a}, expected {expected}"
 
 
-def test_level_3_correctness():
+def test_level_2_correctness():
     pattern = re.compile(r"(-?\d+) ([+\-*]) (-?\d+)")
     for s in range(100):
-        q, a = generate(3, seed=s)
+        q, a = generate(2, seed=s)
         m = pattern.fullmatch(q)
-        assert m, f"unexpected level-3 format: {q!r}"
+        assert m, f"unexpected level-2 format: {q!r}"
         x, op, y = int(m.group(1)), m.group(2), int(m.group(3))
         if op == "+":
             expected = x + y
@@ -80,6 +69,24 @@ def test_level_3_correctness():
             expected = x - y
         else:
             expected = x * y
+        assert int(a) == expected, f"{q} → got {a}, expected {expected}"
+
+
+def test_level_3_correctness():
+    pattern = re.compile(r"\((-?\d+) ([+\-*]) (-?\d+)\) ([+\-*]) (-?\d+)")
+    for s in range(100):
+        q, a = generate(3, seed=s)
+        m = pattern.fullmatch(q)
+        assert m, f"unexpected level-3 format: {q!r}"
+        x, op1, y, op2, z = (
+            int(m.group(1)),
+            m.group(2),
+            int(m.group(3)),
+            m.group(4),
+            int(m.group(5)),
+        )
+        inner = {"+": x + y, "-": x - y, "*": x * y}[op1]
+        expected = {"+": inner + z, "-": inner - z, "*": inner * z}[op2]
         assert int(a) == expected, f"{q} → got {a}, expected {expected}"
 
 

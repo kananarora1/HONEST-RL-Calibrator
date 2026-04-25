@@ -1,14 +1,29 @@
-"""HonestEnvironment — main environment class for the HONEST calibration benchmark."""
+"""HonestEnvironment — main environment class for the HONEST calibration benchmark.
+
+Generators are now backed by the **unified sampler** in ``data/sampler/`` so the
+environment serves curated problems (Hendrycks MATH, MBPP+APPS, ZebraLogic) at
+the difficulty chosen by the adaptive ``DifficultyController``. Procedural-only
+fallback for logic d=1,2 is handled inside the unified sampler itself.
+
+The environment threads the sampler's stable ``problem_id`` through to
+``server.reward.compute_reward``, which dispatches to the unified ``verify()``
+when the id is from the curated dataset and falls back to the local verifier
+for procedural problems.
+"""
 
 import logging
 import random
 import uuid
 from typing import Any, Optional
 
+from data.sampler.environment_adapter import (
+    code_generate,
+    logic_generate,
+    math_generate,
+)
 from models.models import HonestAction, HonestObservation, HonestState
 from openenv.core.env_server.interfaces import Environment
 from server.difficulty import DifficultyController, update_difficulty
-from server.generators import code_gen, logic_gen, math_gen
 from server.reward import compute_reward, parse_action
 
 logger = logging.getLogger(__name__)
@@ -33,15 +48,60 @@ class HonestEnvironment(Environment):
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._state: HonestState = HonestState(episode_id="")
+        # Unified-sampler-backed generators; signature matches the procedural ones
+        # but returns (question, canonical_answer, problem_id).
         self._generators = {
-            "math": math_gen.generate,
-            "code": code_gen.generate,
-            "logic": logic_gen.generate,
+            "math":  math_generate,
+            "code":  code_generate,
+            "logic": logic_generate,
         }
-        # Adaptive difficulty controller — persists across reset() calls.
+        # Adaptive difficulty controller — persists across reset() calls so the
+        # curriculum adapts over the full lifetime of the environment instance.
         self.difficulty_controller = DifficultyController(domains=list(DOMAINS))
         self._current_question: Optional[str] = None
         self._current_answer: Optional[str] = None
+        self._current_problem_id: Optional[str] = None
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _generate_problem(
+        self,
+        domain: str,
+        difficulty: int,
+        seed: Optional[int] = None,
+    ) -> tuple[str, str, str]:
+        """Call the unified sampler for *domain* at *difficulty*.
+
+        Returns ``(question, canonical_answer, problem_id)``. On unexpected
+        failure the call is retried at decreasing difficulty so the env never
+        serves an empty observation.
+        """
+        for diff_try in (difficulty, max(1, difficulty - 1), 1):
+            try:
+                question, answer, pid = self._generators[domain](diff_try, seed=seed)
+                if diff_try != difficulty:
+                    logger.warning(
+                        "Generator(%s, d=%d) failed; fell back to d=%d.",
+                        domain, difficulty, diff_try,
+                    )
+                return question, answer, pid
+            except Exception as exc:
+                logger.warning(
+                    "Generator(%s, d=%d) raised: %s — retrying at lower difficulty.",
+                    domain, diff_try, exc,
+                )
+        # As a last resort produce a trivial math problem so the env stays alive.
+        question, answer, pid = math_generate(1, seed=seed)
+        return question, answer, pid
+
+    def _refresh_controller_snapshot(self) -> None:
+        """Mirror the current controller snapshot onto self._state for observers."""
+        try:
+            self._state.difficulty_controller_state = self.difficulty_controller.snapshot()
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.debug("snapshot() failed: %s", exc)
 
     # ------------------------------------------------------------------
     # reset
@@ -72,15 +132,19 @@ class HonestEnvironment(Environment):
         # (reward, history, observation) reads a consistent scalar.
         difficulty = self.difficulty_controller.sample_difficulty(domain, rng=rng)
         self._state.domain_difficulties[domain] = difficulty
-        question, answer = self._generators[domain](difficulty, seed=seed)
+        question, answer, problem_id = self._generate_problem(domain, difficulty, seed=seed)
         self._current_question = question
         self._current_answer = answer
+        self._current_problem_id = problem_id
+        self._state.current_problem_id = problem_id
+        self._refresh_controller_snapshot()
 
         logger.info(
-            "reset: episode_id=%s domain=%s difficulty=%d",
+            "reset: episode_id=%s domain=%s difficulty=%d problem_id=%s",
             ep_id,
             domain,
             difficulty,
+            problem_id,
         )
 
         return HonestObservation(
@@ -90,9 +154,12 @@ class HonestEnvironment(Environment):
             episode_step=0,
             done=False,
             reward=None,
+            problem_id=problem_id,
         )
 
-    # In server/environment.py -> step()
+    # ------------------------------------------------------------------
+    # step
+    # ------------------------------------------------------------------
 
     def step(
         self,
@@ -103,30 +170,34 @@ class HonestEnvironment(Environment):
         """Process one agent action and advance the environment."""
         domain = self._state.current_domain
         difficulty = self._state.domain_difficulties[domain]
+        problem_id = self._current_problem_id
 
         parsed = parse_action(action.raw_text)
-        
+
         # Handle <request_hint/>
         if parsed.get("type") == "hint":
             reward_value = -0.05  # The cost of information
             correctness = None
             self._state.hints_revealed += 1
-            
+
             # Append a generic hint (in a v2, generators could provide domain-specific hints)
-            self._current_question += f"\n\n[System Hint {self._state.hints_revealed}: Review your assumptions. Break the problem down into smaller discrete steps.]"
-            
+            self._current_question += (
+                f"\n\n[System Hint {self._state.hints_revealed}: Review your assumptions. "
+                f"Break the problem down into smaller discrete steps.]"
+            )
+
             self._state.episode_step += 1
             terminal = self._state.episode_step >= EPISODE_LENGTH
-            
-            # Record action in history
+
             self._state.episode_history.append({
                 "action": "requested_hint",
                 "reward": reward_value,
                 "domain": domain,
                 "difficulty": difficulty,
+                "problem_id": problem_id,
             })
-            
-            # Return observation BUT stay on the current problem
+
+            # Stay on the current problem.
             return HonestObservation(
                 question=self._current_question,
                 domain=domain,
@@ -136,22 +207,25 @@ class HonestEnvironment(Environment):
                 terminal=terminal,
                 done=terminal,
                 reward=reward_value,
+                problem_id=problem_id,
             )
 
-        # STANDARD MDP LOGIC: Handle <answer> or <abstain>
+        # Standard MDP path: <answer> or <abstain> or malformed.
         reward_value, correctness = compute_reward(
             parsed,
             self._current_answer,
             difficulty,
+            problem_id=problem_id,
             domain=domain,
         )
 
         # Append the single authoritative history record for this step.
-        # update_difficulty() will read it (for rolling accuracy) and must
-        # NOT append anything itself.
+        # update_difficulty() reads it (for rolling accuracy) and must NOT
+        # append anything itself.
         step_record: dict = {
             "question": self._current_question,
             "ground_truth": self._current_answer,
+            "problem_id": problem_id,
             "parsed": parsed,
             "correct": correctness,
             "reward": reward_value,
@@ -164,7 +238,9 @@ class HonestEnvironment(Environment):
 
         self._state.episode_step += 1
 
-        # Legacy per-episode scalar update (still consumed by some tests).
+        # Legacy per-episode scalar update — retained as a no-op compatibility
+        # shim for tests that mock it. The real adaptive logic lives in the
+        # DifficultyController below.
         difficulty_update = update_difficulty(self._state, correctness, domain=domain)
         if isinstance(difficulty_update, tuple) and len(difficulty_update) >= 2:
             diff_changed = bool(difficulty_update[1])
@@ -201,6 +277,7 @@ class HonestEnvironment(Environment):
         )
 
         if terminal:
+            self._refresh_controller_snapshot()
             return HonestObservation(
                 question="",
                 domain=domain,
@@ -210,6 +287,7 @@ class HonestEnvironment(Environment):
                 terminal=True,
                 done=True,
                 reward=reward_value,
+                problem_id=problem_id,
             )
 
         # Pick next problem — domain uniformly random; difficulty from controller.
@@ -217,11 +295,16 @@ class HonestEnvironment(Environment):
         self._state.current_domain = next_domain
         next_difficulty = self.difficulty_controller.sample_difficulty(next_domain)
         self._state.domain_difficulties[next_domain] = next_difficulty
-        next_question, next_answer = self._generators[next_domain](next_difficulty)
-        
+        next_question, next_answer, next_problem_id = self._generate_problem(
+            next_domain, next_difficulty
+        )
+
         self._current_question = next_question
         self._current_answer = next_answer
-        self._state.hints_revealed = 0 # Reset hints for the new problem
+        self._current_problem_id = next_problem_id
+        self._state.current_problem_id = next_problem_id
+        self._state.hints_revealed = 0  # Reset hints for the new problem
+        self._refresh_controller_snapshot()
 
         return HonestObservation(
             question=next_question,
@@ -232,6 +315,7 @@ class HonestEnvironment(Environment):
             terminal=False,
             done=False,
             reward=reward_value,
+            problem_id=next_problem_id,
         )
 
     # state property
