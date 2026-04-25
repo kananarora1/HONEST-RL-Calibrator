@@ -333,7 +333,6 @@ def main():
         report_to=report_to,
         seed=args.seed,
         
-        environment_factory=lambda: HonestEnv(base_url=env_url).sync() if env_url else None,
         **({  "max_steps": args.max_steps} if args.max_steps else {}),
     )
 
