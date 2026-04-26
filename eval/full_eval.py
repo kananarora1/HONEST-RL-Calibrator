@@ -351,7 +351,7 @@ def main():
     parser.add_argument(
         "--reasoning-mode",
         choices=list(REASONING_MODES),
-        default="optional",
+        default="required",
         help="Prompt mode used at evaluation time.",
     )
     parser.add_argument("--skip-indist",       action="store_true",

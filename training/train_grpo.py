@@ -618,8 +618,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--reasoning-mode",
         choices=list(REASONING_MODES),
-        default="optional",
-        help="Prompt style: none (fast), optional (recommended), required (strict CoT).",
+        default="required",
+        help="Prompt style. Only 'required' is supported (strict CoT with <reasoning>).",
     )
     p.add_argument("--output-dir", type=str, default=None,
                    help="Output directory. Defaults to ./honest-{model-slug}-grpo")
