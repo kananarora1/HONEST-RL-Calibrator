@@ -38,12 +38,24 @@ from data.sampler.environment_adapter import (
     math_generate,
 )
 from server.difficulty import DifficultyController
+from server.hindsight import (
+    DEFAULT_HINDSIGHT_WEIGHT,
+    parse_hindsight,
+    reward_hindsight,
+)
+from server.mutators import (
+    DistractorMutator,
+    NumericMutator,
+    SelfMutatingCurriculum,
+)
+from server.replay_buffer import CalibrationPrioritizedReplay
 from server.reward import (
     compute_reward,
     parse_action,
     reward_accuracy,
     reward_format,
 )
+from server.self_play import StubProblemGenerator
 from calibration_profiles import (
     REASONING_MODES,
     SUPPORTED_PRESETS,
@@ -62,7 +74,7 @@ log = logging.getLogger("grpo")
 # Defaults: preset auto-inferred from --model-id will override these where
 # unset. Hard-coded value below is used only for argparse display / when no
 # preset is selected.
-MODEL_ID         = "Qwen/Qwen2.5-7B-Instruct"
+MODEL_ID         = "Qwen/Qwen2.5-3B-Instruct"
 MAX_SEQ_LEN      = 2048
 DOMAINS          = ["math", "code", "logic"]
 
@@ -95,6 +107,10 @@ def build_prompt_dataset(
     system_prompt: str,
     user_template: str,
     domain_weights: Dict[str, float],
+    smc: Optional[SelfMutatingCurriculum] = None,
+    replay_buffer: Optional[CalibrationPrioritizedReplay] = None,
+    replay_mix: float = 0.0,
+    replay_warmup: int = 100,
 ) -> Dataset:
     """Build a *lazy* GRPO prompt dataset.
 
@@ -151,18 +167,55 @@ def build_prompt_dataset(
     if sum(domain_pool_weights) <= 0.0:
         domain_pool_weights = [1.0] * len(domain_pool)
 
+    def _sample_problem(domain: str, difficulty: int) -> tuple:
+        """Route to SMC if available (so d>5 produces mutated problems), else
+        delegate to the unified-sampler-backed generator directly. Returns
+        ``(question, ground_truth, problem_id)``."""
+        if smc is not None:
+            return smc.sample(domain, difficulty, rng=sampling_rng)
+        return GENERATORS[domain](
+            difficulty, seed=sampling_rng.randint(0, 2**31 - 1),
+        )
+
+    def _maybe_replay_one() -> Optional[dict]:
+        """With probability ``replay_mix`` and once warm, return an existing
+        miscalibrated prompt from the replay buffer instead of sampling fresh.
+
+        The replay buffer is populated by the reward wrapper after every
+        rollout group (CPR — Pillar 2). See SELF_LEARNING.md §3.
+        """
+        if replay_buffer is None or replay_mix <= 0.0:
+            return None
+        if not replay_buffer.is_warm(replay_warmup):
+            return None
+        if sampling_rng.random() >= replay_mix:
+            return None
+        sampled = replay_buffer.sample(1, rng=sampling_rng)
+        if not sampled:
+            return None
+        e = sampled[0]
+        # The stored prompt is already a chat-formatted string; just reuse it.
+        return {
+            "prompt":       e.prompt,
+            "ground_truth": e.ground_truth,
+            "difficulty":   int(e.difficulty),
+            "domain":       e.domain,
+            "problem_id":   e.problem_id,
+        }
+
     def _resolve_one() -> dict:
         """Sample one (domain, difficulty) and call the unified sampler."""
+        replay = _maybe_replay_one()
+        if replay is not None:
+            return replay
+
         for _attempt in range(20):
             domain = sampling_rng.choices(
                 domain_pool, weights=domain_pool_weights, k=1,
             )[0]
             difficulty = controller.sample_difficulty(domain, rng=sampling_rng)
             try:
-                question, ground_truth, problem_id = GENERATORS[domain](
-                    difficulty,
-                    seed=sampling_rng.randint(0, 2**31 - 1),
-                )
+                question, ground_truth, problem_id = _sample_problem(domain, difficulty)
                 return {
                     "prompt":       _build_prompt_text(tokenizer, question, system_prompt, user_template),
                     "ground_truth": str(ground_truth),
@@ -234,11 +287,18 @@ def _log_reward_dist(rewards: List[float], step: int) -> None:
 def make_brier_reward(
     step_ref: list,
     controller: Optional[DifficultyController] = None,
+    smc: Optional[SelfMutatingCurriculum] = None,
+    replay_buffer: Optional[CalibrationPrioritizedReplay] = None,
 ):
     """Return a TRL-compatible reward function that:
-      1) computes the calibrated Brier reward (the model's primary signal), AND
+      1) computes the calibrated Brier reward (the model's primary signal),
       2) (if a controller is provided) records ONE outcome per unique prompt
-         into ``controller`` so the curriculum actually moves during training.
+         into ``controller`` so the curriculum actually moves during training,
+      3) (if SMC is provided) calls ``smc.maybe_promote/maybe_demote`` after
+         each outcome so the ceiling adapts (Pillar 3),
+      4) (if a replay buffer is provided) appends one (prompt, conf, correct)
+         tuple per unique prompt to the buffer, with majority-vote correctness
+         and mean confidence (Pillar 2).
 
     Outcome aggregation: TRL calls a reward function once per *batch*, where
     a batch contains ``num_generations`` completions for *one* prompt
@@ -247,10 +307,6 @@ def make_brier_reward(
     majority vote, then call ``controller.record_outcome`` exactly once per
     distinct prompt. This avoids over-weighting a single prompt by treating
     its 16 correlated rollouts as 16 independent observations.
-
-    When ``controller=None`` (the ``--no-controller`` path), the function still
-    computes Brier rewards and logs distributions, but skips outcome
-    recording entirely — so the curriculum stays at its initial target.
     """
 
     def _wrapped(
@@ -266,7 +322,12 @@ def make_brier_reward(
         v_metas = kwargs.get("verification_metadata") or [{}] * n
 
         rewards: List[float] = []
+        # Per-(domain, pid) aggregations: majority-vote correctness + mean conf.
         group_correct: Dict[tuple, list] = defaultdict(list)
+        group_conf:    Dict[tuple, list] = defaultdict(list)
+        # Sticky reference prompt + gt + diff per (domain, pid) so the replay
+        # buffer can store them. Same prompt for every member of the group.
+        group_meta: Dict[tuple, dict] = {}
 
         for idx, (comp, gt, diff) in enumerate(zip(completions, ground_truth, difficulty)):
             domain = domains[idx] if idx < len(domains) else None
@@ -284,21 +345,59 @@ def make_brier_reward(
             )
             rewards.append(float(r))
 
-            # Only real Answer outcomes (True/False) feed the controller.
+            # Only real Answer outcomes (True/False) feed the controller / buffer.
             # Abstain / hint / malformed → correct is None → skip.
-            if controller is not None and correct is not None and domain in DOMAINS:
-                group_correct[(domain, pid)].append(bool(correct))
+            if correct is not None and domain in DOMAINS:
+                key = (domain, pid)
+                group_correct[key].append(bool(correct))
+                if parsed.get("type") == "answer":
+                    try:
+                        group_conf[key].append(float(parsed.get("confidence", 0.5)))
+                    except (TypeError, ValueError):
+                        group_conf[key].append(0.5)
+                if key not in group_meta and idx < len(prompts):
+                    group_meta[key] = {
+                        "prompt": prompts[idx],
+                        "ground_truth": str(gt),
+                        "difficulty": int(diff),
+                    }
 
         # Record one outcome per unique (domain, problem_id) — majority vote.
-        if controller is not None:
-            for (dom, _pid), corrects in group_correct.items():
-                if not corrects:
-                    continue
-                majority = sum(corrects) > (len(corrects) / 2.0)
+        for key, corrects in group_correct.items():
+            if not corrects:
+                continue
+            majority = sum(corrects) > (len(corrects) / 2.0)
+            domain, pid = key
+
+            if controller is not None:
                 try:
-                    controller.record_outcome(dom, majority)
+                    controller.record_outcome(domain, majority)
                 except Exception as exc:
-                    log.debug("record_outcome(%s, %s) raised: %s", dom, majority, exc)
+                    log.debug("record_outcome(%s, %s) raised: %s", domain, majority, exc)
+
+            if smc is not None:
+                try:
+                    smc.maybe_promote(domain)
+                    smc.maybe_demote(domain)
+                except Exception as exc:
+                    log.debug("smc promote/demote(%s) raised: %s", domain, exc)
+
+            if replay_buffer is not None and key in group_meta:
+                meta = group_meta[key]
+                confs = group_conf.get(key) or [0.5]
+                mean_conf = sum(confs) / len(confs)
+                try:
+                    replay_buffer.add(
+                        prompt=meta["prompt"],
+                        ground_truth=meta["ground_truth"],
+                        domain=domain,
+                        difficulty=meta["difficulty"],
+                        problem_id=str(pid),
+                        confidence=mean_conf,
+                        correctness=bool(majority),
+                    )
+                except Exception as exc:
+                    log.debug("replay_buffer.add raised: %s", exc)
 
         # Log running reward distribution.
         step_ref[0] += 1
@@ -306,10 +405,83 @@ def make_brier_reward(
 
         return rewards
 
-    _wrapped.__name__ = (
-        "reward_brier_with_curriculum_feedback"
-        if controller is not None else "reward_brier"
-    )
+    name_parts = ["reward_brier"]
+    if controller is not None:
+        name_parts.append("curriculum")
+    if smc is not None:
+        name_parts.append("smc")
+    if replay_buffer is not None:
+        name_parts.append("replay")
+    _wrapped.__name__ = "_".join(name_parts)
+    return _wrapped
+
+
+def make_train_time_hindsight_reward(
+    weight: float = DEFAULT_HINDSIGHT_WEIGHT,
+):
+    """Trainer-time hindsight reward — Pillar 1 auxiliary head.
+
+    The training pipeline is single-pass (TRL doesn't natively support a
+    two-stage rollout per prompt without a custom Trainer subclass). For
+    training time we therefore train a *self-prediction* head: when the
+    completion contains both <confidence>c</confidence> AND
+    <hindsight>r</hindsight>, we grade the retrospective r against the
+    *actual* correctness of the answer in the same completion.
+
+    This is **not** the full Hindsight Experience Replay protocol (see
+    SELF_LEARNING.md §2.3) — but it does give the model an incentive to
+    emit a hindsight tag aligned with its own correctness, which:
+      - trains an internal correctness predictor head
+      - acts as a self-distillation regulariser on confidence
+
+    The full HER protocol is reserved for *environment-time* rollouts via
+    ``HonestEnvironment(hindsight_probability=...)``.
+
+    Returns 0.0 when <hindsight> is missing — adds zero noise to forward-
+    only training.
+    """
+
+    def _wrapped(
+        completions: List[str],
+        prompts: List[str] = None,
+        ground_truth: List[str] = None,
+        **kwargs: Any,
+    ) -> List[float]:
+        n = len(completions)
+        gts = ground_truth or [""] * n
+        domains = kwargs.get("domain") or [None] * n
+        pids = kwargs.get("problem_id") or [None] * n
+        v_metas = kwargs.get("verification_metadata") or [{}] * n
+        rewards: List[float] = []
+        for idx, comp in enumerate(completions):
+            hs = parse_hindsight(comp)
+            if hs.get("type") != "hindsight":
+                rewards.append(0.0)
+                continue
+            parsed = parse_action(comp)
+            if parsed.get("type") != "answer":
+                rewards.append(0.0)
+                continue
+            domain = domains[idx] if idx < len(domains) else None
+            pid    = pids[idx] if idx < len(pids) else None
+            v_meta = v_metas[idx] if idx < len(v_metas) else {}
+            _r, correct = compute_reward(
+                parsed,
+                str(gts[idx] if idx < len(gts) else ""),
+                1,
+                problem_id=pid,
+                domain=domain,
+                verification_metadata=v_meta,
+            )
+            if correct is None:
+                rewards.append(0.0)
+                continue
+            r = hs["retrospective"]
+            y = 1.0 if correct else 0.0
+            rewards.append(-float(weight) * (r - y) ** 2)
+        return rewards
+
+    _wrapped.__name__ = f"reward_hindsight_train_x{weight:g}"
     return _wrapped
 
 
@@ -550,10 +722,18 @@ class DifficultyControllerLogCallback(TrainerCallback):
 
     Logs 5 keys per domain × 3 domains = 15 keys per step:
     target, rolling_acc, dist_d1, dist_d3, dist_d5.
+
+    When SMC is enabled, also logs the per-domain ceiling so the W&B
+    dashboard shows the curriculum unlocking new tiers.
     """
 
-    def __init__(self, controller: DifficultyController):
+    def __init__(
+        self,
+        controller: DifficultyController,
+        smc: Optional[SelfMutatingCurriculum] = None,
+    ):
         self.controller = controller
+        self.smc = smc
 
     def on_log(self, args, state, control, logs=None, **kwargs):
         if logs is None:
@@ -568,6 +748,35 @@ class DifficultyControllerLogCallback(TrainerCallback):
             logs[f"difficulty/{domain}/dist_d1"] = dist[0]
             logs[f"difficulty/{domain}/dist_d3"] = dist[2]
             logs[f"difficulty/{domain}/dist_d5"] = dist[4]
+
+        if self.smc is not None:
+            for domain, s in self.smc.snapshot().items():
+                logs[f"difficulty/{domain}/ceiling"] = s["ceiling"]
+
+
+class ReplayBufferLogCallback(TrainerCallback):
+    """Emit CalibrationPrioritizedReplay snapshot to TRL logs (Pillar 2).
+
+    Three keys per step: size, mean_miscal, normalised_entropy. The
+    normalised entropy ratio is the guardrail signal — values < 0.5 mean
+    a few prompts dominate the buffer's view and the replay mix should be
+    revisited.
+    """
+
+    def __init__(self, buffer: CalibrationPrioritizedReplay):
+        self.buffer = buffer
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs is None:
+            return
+        snap = self.buffer.snapshot()
+        if snap["size"] == 0:
+            return
+        logs["replay/size"] = snap["size"]
+        if snap["mean_miscal"] is not None:
+            logs["replay/mean_miscal"] = snap["mean_miscal"]
+        if snap["entropy"] is not None and snap["max_entropy"]:
+            logs["replay/entropy_ratio"] = snap["entropy"] / max(snap["max_entropy"], 1e-9)
 
 
 # ---------------------------------------------------------------------------
@@ -676,6 +885,50 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Per-domain initial target_difficulty. Defaults to preset value.",
     )
+
+    # ─ Self-learning calibration (SELF_LEARNING.md) ──────────────────────
+    p.add_argument(
+        "--hindsight",
+        action="store_true",
+        help="[Pillar 1] Enable trainer-time hindsight reward "
+             "(self-prediction head). Adds a third reward function.",
+    )
+    p.add_argument(
+        "--hindsight-weight",
+        type=float,
+        default=DEFAULT_HINDSIGHT_WEIGHT,
+        help="Weight k for hindsight reward; -k(r-y)^2.",
+    )
+    p.add_argument(
+        "--replay-priority",
+        action="store_true",
+        help="[Pillar 2] Enable CalibrationPrioritizedReplay over recent rollouts.",
+    )
+    p.add_argument("--replay-buffer-size", type=int, default=4096)
+    p.add_argument(
+        "--replay-mix",
+        type=float, default=0.3,
+        help="Probability per fresh prompt that we draw from buffer instead of sampler.",
+    )
+    p.add_argument(
+        "--replay-warmup",
+        type=int, default=100,
+        help="Min buffer size before replay sampling activates.",
+    )
+    p.add_argument("--replay-alpha", type=float, default=0.6)
+    p.add_argument(
+        "--self-mutate",
+        action="store_true",
+        help="[Pillar 3] Enable SelfMutatingCurriculum (recursive amplification).",
+    )
+    p.add_argument("--smc-max-hard-difficulty", type=int, default=8)
+    p.add_argument("--smc-promote-threshold", type=float, default=0.75)
+    p.add_argument("--smc-min-episodes-at-max", type=int, default=20)
+    p.add_argument(
+        "--self-play",
+        action="store_true",
+        help="[Pillar 4] Enable Generator/Solver self-play loop (v1: stub generator).",
+    )
     return p
 
 
@@ -688,9 +941,11 @@ def _apply_preset_defaults(args, preset) -> None:
     if args.num_generations is None:
         args.num_generations = preset.default_num_generations
     if args.gradient_accumulation_steps is None:
-        # Smaller models need more accumulation to keep effective batch ≥ 64
-        # while we hold per_device_train_batch_size at 1.
-        args.gradient_accumulation_steps = 8 if preset.name == "qwen7b" else 16
+        # Effective batch target: preset-aware. Qwen-3B and Phi-4-mini-3.8B
+        # use ga=8 (G≥8 already gives ≥64 effective rollouts); Llama-3B
+        # uses ga=16 because its lr is more conservative and a larger
+        # effective batch protects against format collapse.
+        args.gradient_accumulation_steps = 16 if preset.name == "llama3b" else 8
     if args.max_completion_length is None:
         args.max_completion_length = preset.default_max_completion_length
     if args.temperature is None:
@@ -713,8 +968,13 @@ def _apply_colab_profile_caps(args) -> None:
     rather than crashing OOM mid-training.
     """
     profile_caps = {
+        # Caps assume single-GPU 3-4B models in 4-bit QLoRA. They size
+        # ``r`` against the largest preset that targets each tier:
+        #   T4   (16 GB) — Phi-4-mini-3.8B → r ≤ 16 (tight headroom).
+        #   L4   (24 GB) — Qwen-3B / Llama-3B / Phi-4-mini → r ≤ 32 (~7 GB peak).
+        #   A100 (40 GB) — any of the above → r ≤ 32 (~12 GB peak with G=16).
         "t4":   {"G": 4,  "max_len": 512,  "r": 16, "min_ga": 16},
-        "l4":   {"G": 10, "max_len": 640,  "r": 16, "min_ga": 8},
+        "l4":   {"G": 10, "max_len": 640,  "r": 32, "min_ga": 8},
         "a100": {"G": 16, "max_len": 1024, "r": 32, "min_ga": 4},
         "none": None,
     }
@@ -787,11 +1047,36 @@ def main():
     )
     feedback_controller = None if args.no_controller else difficulty_controller
 
+    # Self-learning components (all opt-in).
+    smc = None
+    if args.self_mutate:
+        smc = SelfMutatingCurriculum(
+            controller=difficulty_controller,
+            base_sources={d: GENERATORS[d] for d in DOMAINS},
+            mutators=[
+                NumericMutator(seed=args.seed),
+                DistractorMutator(seed=args.seed),
+            ],
+            max_hard_difficulty=args.smc_max_hard_difficulty,
+            promote_threshold=args.smc_promote_threshold,
+            min_episodes_at_max=args.smc_min_episodes_at_max,
+            seed=args.seed,
+        )
+
+    replay_buffer = None
+    if args.replay_priority:
+        replay_buffer = CalibrationPrioritizedReplay(
+            capacity=args.replay_buffer_size,
+            alpha=args.replay_alpha,
+            seed=args.seed,
+        )
+
     # ─── Dry run smoke test ─────────────────────────────────────────────
     if args.dry_run:
         dry_completions = [
             "<reasoning>r</reasoning><answer>42</answer><confidence>0.9</confidence>",
-            "<reasoning>r</reasoning><answer>41</answer><confidence>0.5</confidence>",
+            "<reasoning>r</reasoning><answer>41</answer><confidence>0.5</confidence>"
+            "<hindsight>0.4</hindsight>",
             "<abstain/>",
             "malformed output",
         ]
@@ -799,11 +1084,17 @@ def main():
         dry_diff    = [1, 1, 1, 1]
         dry_domains = ["math", "math", "math", "math"]
         dry_pids    = ["procedural_math_d1_dryrun"] * 4
+        dry_prompts = ["dummy_prompt"] * 4
 
         step_ref = [0]
-        wrapped = make_brier_reward(step_ref, controller=feedback_controller)
+        wrapped = make_brier_reward(
+            step_ref,
+            controller=feedback_controller,
+            smc=smc,
+            replay_buffer=replay_buffer,
+        )
         rewards = wrapped(
-            dry_completions, [], dry_gt, dry_diff,
+            dry_completions, dry_prompts, dry_gt, dry_diff,
             domain=dry_domains, problem_id=dry_pids,
         )
         weighted_format = make_weighted(reward_format, preset.reward_format_weight, "format")
@@ -818,7 +1109,15 @@ def main():
               f"{weighted_format(dry_completions)}")
         print(f"  reward_accuracy      (×{preset.reward_accuracy_weight}): "
               f"{weighted_accuracy(dry_completions, [], dry_gt, domain=dry_domains, problem_id=dry_pids)}")
+        if args.hindsight:
+            hs = make_train_time_hindsight_reward(weight=args.hindsight_weight)
+            print(f"  reward_hindsight     (×{args.hindsight_weight}): "
+                  f"{hs(dry_completions, dry_prompts, dry_gt, domain=dry_domains, problem_id=dry_pids)}")
         print(f"  controller snapshot (math):  {difficulty_controller.snapshot()['math']}")
+        if smc is not None:
+            print(f"  SMC snapshot:                {smc.snapshot()}")
+        if replay_buffer is not None:
+            print(f"  replay_buffer:               {replay_buffer.snapshot()}")
         print(f"  KL schedule:                 beta {args.beta:.4f} → {preset.beta_end:.4f} "
               f"@ step {int((args.max_steps or 0) * preset.kl_relax_frac)}/{args.max_steps}")
         print(f"  hyperparams:                 G={args.num_generations} "
@@ -826,6 +1125,9 @@ def main():
               f"lr={args.learning_rate:g} temp={args.temperature} lora_r={args.lora_r}")
         print(f"  curriculum mode:             "
               f"{'ADAPTIVE' if feedback_controller else 'STATIC (init_target=' + str(initial_target) + ')'}")
+        print(f"  self-learning flags:         "
+              f"hindsight={args.hindsight} replay={args.replay_priority} "
+              f"smc={args.self_mutate} self_play={args.self_play}")
         return
 
     if not torch.cuda.is_available():
@@ -861,17 +1163,30 @@ def main():
         system_prompt=system_prompt,
         user_template=user_template,
         domain_weights=domain_weights,
+        smc=smc,
+        replay_buffer=replay_buffer,
+        replay_mix=(args.replay_mix if args.replay_priority else 0.0),
+        replay_warmup=args.replay_warmup,
     )
     bf16 = _is_bfloat16_supported()
 
     step_ref = [0]
-    brier_with_feedback = make_brier_reward(step_ref, controller=feedback_controller)
+    brier_with_feedback = make_brier_reward(
+        step_ref,
+        controller=feedback_controller,
+        smc=smc,
+        replay_buffer=replay_buffer,
+    )
     weighted_format = make_weighted(
         reward_format, preset.reward_format_weight, "format",
     )
     weighted_accuracy = make_weighted(
         reward_accuracy, preset.reward_accuracy_weight, "accuracy",
     )
+
+    reward_funcs: list = [brier_with_feedback, weighted_format, weighted_accuracy]
+    if args.hindsight:
+        reward_funcs.append(make_train_time_hindsight_reward(weight=args.hindsight_weight))
 
     grpo_config = GRPOConfig(
         output_dir=args.output_dir,
@@ -919,15 +1234,18 @@ def main():
         RewardHealthCallback(warn_threshold=1e-4, warn_patience=5, fatal_patience=30),
     ]
     if feedback_controller is not None:
-        callbacks.append(DifficultyControllerLogCallback(difficulty_controller))
+        callbacks.append(DifficultyControllerLogCallback(difficulty_controller, smc=smc))
+    if replay_buffer is not None:
+        callbacks.append(ReplayBufferLogCallback(replay_buffer))
 
     trainer = GRPOTrainer(
         model=model,
         # brier_with_feedback is the primary calibration reward AND the
-        # curriculum feedback channel. reward_format and reward_accuracy
-        # are auxiliary signals (XML compliance + correctness bonus),
-        # weighted per-preset.
-        reward_funcs=[brier_with_feedback, weighted_format, weighted_accuracy],
+        # curriculum + replay + SMC feedback channel. reward_format and
+        # reward_accuracy are auxiliary signals (XML compliance + correctness
+        # bonus). reward_hindsight (when --hindsight) is the trainer-time
+        # self-prediction head — see SELF_LEARNING.md §2.
+        reward_funcs=reward_funcs,
         args=grpo_config,
         train_dataset=train_dataset,
         processing_class=tokenizer,
@@ -978,6 +1296,25 @@ def main():
         args.lora_r,
         args.lora_alpha,
     )
+    selfl_flags = []
+    if args.hindsight:
+        selfl_flags.append(f"hindsight(w={args.hindsight_weight})")
+    if args.replay_priority:
+        selfl_flags.append(
+            f"replay(size={args.replay_buffer_size},mix={args.replay_mix},"
+            f"alpha={args.replay_alpha})"
+        )
+    if args.self_mutate:
+        selfl_flags.append(
+            f"smc(max_d={args.smc_max_hard_difficulty},"
+            f"thr={args.smc_promote_threshold})"
+        )
+    if args.self_play:
+        selfl_flags.append("self_play(stub_generator)")
+    log.info(
+        "Self-learning: %s",
+        ", ".join(selfl_flags) if selfl_flags else "off (legacy GRPO)",
+    )
     log.info("=" * 60)
 
     t0 = time.time()
@@ -997,6 +1334,16 @@ def main():
         difficulty_controller.snapshot(), indent=2, default=str,
     ))
     log.info(f"Final controller state -> {snap_path}")
+
+    if smc is not None:
+        smc_path = out_path / "final_adapters" / "smc_state.json"
+        smc_path.write_text(json.dumps(smc.snapshot(), indent=2, default=str))
+        log.info(f"Final SMC state        -> {smc_path}")
+
+    if replay_buffer is not None:
+        rep_path = out_path / "final_adapters" / "replay_state.json"
+        rep_path.write_text(json.dumps(replay_buffer.snapshot(), indent=2, default=str))
+        log.info(f"Final replay state     -> {rep_path}")
 
 
 if __name__ == "__main__":

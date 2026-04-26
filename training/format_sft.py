@@ -39,7 +39,14 @@ from trl import SFTTrainer
 from transformers import TrainingArguments
 
 from server.generators import math_gen, code_gen, logic_gen
-from eval.baseline_eval import SYSTEM_PROMPT, USER_TEMPLATE
+from calibration_profiles import prompt_templates
+
+# Format-SFT teaches the strict-XML contract that the rest of the pipeline
+# enforces. We use the "required" reasoning mode here even though training
+# may run in "optional" — the assistant target text already includes the
+# canonical format, so seeing the strict-mode user template at SFT time
+# only reinforces it without changing what the model has to emit.
+SYSTEM_PROMPT, USER_TEMPLATE = prompt_templates("required")
 
 # ---------------------------------------------------------------------------
 # Config
