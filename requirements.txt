@@ -1,7 +1,7 @@
 openenv-core>=0.2.1
 fastapi
-uvicorn
-pydantic
+uvicorn[standard]
+pydantic>=2.0
 python-constraint>=1.4
 datasets>=2.21
 sympy>=1.13
@@ -10,12 +10,25 @@ antlr4-python3-runtime>=4.11
 
 # RL Training Dependencies
 torch
-transformers
-trl
-peft
-accelerate
+transformers>=4.45
+trl>=0.21
+peft>=0.12
+accelerate>=0.33
 bitsandbytes
 deepspeed
 wandb
 numpy
 unsloth
+
+# Evaluation + plotting
+matplotlib
+seaborn
+scikit-learn
+
+# Test deps
+pytest
+pytest-asyncio
+httpx
+
+# MCP deployment wrapper (mcp_server/)
+mcp>=1.0
