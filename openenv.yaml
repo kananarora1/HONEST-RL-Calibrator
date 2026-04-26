@@ -1,0 +1,21 @@
+spec_version: 1
+name: honest_env
+type: space
+runtime: fastapi
+app: server.app:app
+port: 8000
+description: >
+  HONEST — Honesty-Optimised and Normalized Environment for Self-Triage.
+  An OpenEnv-compliant calibration benchmark where LLM agents must emit
+  an answer together with a self-reported confidence (or explicitly
+  abstain). Reward is the Brier score, a strictly proper scoring rule.
+  Three domains (math, code, logic) at five difficulty levels.
+license: BSD-3-Clause
+homepage: https://github.com/Rushhaabhhh/HONEST-RL-Calibrator
+tags:
+  - openenv
+  - calibration
+  - rl
+  - grpo
+  - mcp
+  - honesty

@@ -1,0 +1,117 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "honest-env"
+version = "0.1.0"
+description = "HONEST — Honesty-Optimised and Normalized Environment for Self-Triage. An OpenEnv calibration benchmark for LLM agents trained to report calibrated confidence."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "BSD-3-Clause" }
+authors = [
+    { name = "HONEST-Env Contributors" },
+]
+keywords = ["openenv", "calibration", "rl", "grpo", "mcp", "honesty", "llm"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: BSD License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    # Core OpenEnv runtime (FastAPI server + HTTP client types)
+    "openenv-core>=0.2.1",
+    # Web stack
+    "fastapi",
+    "uvicorn[standard]",
+    "pydantic>=2.0",
+    # Verifiers and dataset ingestion
+    "datasets>=2.21",
+    "sympy>=1.13",
+    "python-constraint>=1.4",
+    "z3-solver>=4.13",
+    "antlr4-python3-runtime>=4.11",
+    # Numerics + plotting (used by eval/, training/, bin/plot_training_curves.py)
+    "numpy",
+    "matplotlib",
+    "seaborn",
+    "scikit-learn",
+    # MCP deployment wrapper
+    "mcp>=1.0",
+]
+
+[project.optional-dependencies]
+# Pulled in only on the GPU training box. Kept out of the base server
+# image so the OpenEnv container stays small.
+training = [
+    "torch",
+    "transformers>=4.45",
+    "trl>=0.21",
+    "peft>=0.12",
+    "accelerate>=0.33",
+    "bitsandbytes",
+    "deepspeed",
+    "wandb",
+    "unsloth",
+]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio",
+    "pytest-cov>=4.0.0",
+    "httpx",
+    "ruff",
+]
+
+[project.urls]
+Homepage = "https://github.com/Rushhaabhhh/HONEST-RL-Calibrator"
+Repository = "https://github.com/Rushhaabhhh/HONEST-RL-Calibrator"
+Documentation = "https://github.com/Rushhaabhhh/HONEST-RL-Calibrator/blob/main/RUNBOOK.md"
+
+[project.scripts]
+# Server entry point — enables: `uv run --project . server` and `python -m server.app`
+server = "server.app:main"
+# Trained-model MCP wrapper — enables: `honest-mcp` after `pip install .`
+honest-mcp = "mcp_server.__main__:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = [
+    "server*",
+    "models*",
+    "client*",
+    "data*",
+    "eval*",
+    "training*",
+    "mcp_server*",
+]
+exclude = [
+    "tests*",
+    "venv*",
+    ".venv*",
+    "docs*",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "data/tests"]
+asyncio_mode = "auto"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["venv", ".venv", "build", "dist"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
