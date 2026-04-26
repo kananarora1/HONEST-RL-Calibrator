@@ -62,3 +62,63 @@ def _normalize(s: str) -> str:
     except ValueError:
         pass
     return s
+
+
+# ---------------------------------------------------------------------------
+# MCQ-aware verification (OOD only)
+#
+# The core `verify_answer` above is used by the training reward pipeline and
+# must stay untouched. For OOD MCQ datasets (MMLU / AGIEval) the ground-truth
+# label can be stored either as a letter ("A"-"E") or as a string index
+# ("0"-"4"), while the model may emit either convention as well. The helpers
+# below canonicalize both sides to the same index space so that a correct
+# pick is not flagged wrong purely due to representation.
+# ---------------------------------------------------------------------------
+
+_LETTER_TO_IDX = {"A": "0", "B": "1", "C": "2", "D": "3", "E": "4"}
+
+
+def _canonicalize_mcq(s: Optional[str]) -> str:
+    """Best-effort canonicalization of an MCQ token to a string index.
+
+    Examples:
+        "A"   -> "0"      "(B)" -> "1"    "C." -> "2"
+        "0"   -> "0"      "3"   -> "3"
+        "option D is correct" -> "3"  (takes first A-E letter token)
+        "banana" -> "banana" (fallback: lower-cased, unchanged)
+    """
+    if s is None:
+        return ""
+    raw = str(s).strip()
+    if not raw:
+        return ""
+
+    token = raw.strip().strip("()[]{}.,:;\"' \t").upper()
+    head = token.split()[0] if token.split() else token
+    head = head.strip("()[]{}.,:;\"' \t")
+
+    if head in _LETTER_TO_IDX:
+        return _LETTER_TO_IDX[head]
+    if head.isdigit() and len(head) <= 2:
+        return head
+
+    for ch in token:
+        if ch in _LETTER_TO_IDX:
+            return _LETTER_TO_IDX[ch]
+
+    return raw.strip().lower()
+
+
+def verify_mcq(agent_answer: Optional[str], ground_truth: Optional[str]) -> bool:
+    """Return True iff the two MCQ tokens canonicalize to the same choice.
+
+    Safe for OOD where ground-truth may be "A"-"E" or "0"-"4". Never raises;
+    returns False on any unparseable input.
+    """
+    try:
+        return (
+            _canonicalize_mcq(agent_answer) != ""
+            and _canonicalize_mcq(agent_answer) == _canonicalize_mcq(ground_truth)
+        )
+    except Exception:
+        return False

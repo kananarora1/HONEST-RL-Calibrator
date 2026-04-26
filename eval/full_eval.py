@@ -26,7 +26,13 @@ from typing import Optional
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from server.reward import compute_reward, parse_action           # noqa: E402
+from server.reward import (  # noqa: E402
+    FORMAT_BONUS,
+    compute_reward,
+    parse_action,
+    parse_action_lenient,
+)
+from server.verifier import verify_mcq                           # noqa: E402
 from eval.metrics import compute_brier, compute_ece, compute_ace, compute_mce  # noqa: E402
 from server.generators import code_gen, logic_gen, math_gen      # noqa: E402
 from calibration_profiles import (  # noqa: E402
@@ -34,6 +40,29 @@ from calibration_profiles import (  # noqa: E402
     SUPPORTED_PRESETS,
     get_preset,
     prompt_templates,
+)
+
+
+# ---------------------------------------------------------------------------
+# OOD-specific prompt
+#
+# The default HONEST prompt is domain-agnostic and leaves the answer format
+# open-ended. OOD datasets (MMLU / AGIEval) are strictly multiple-choice, so
+# we give the model a narrower contract: reasoning + a single letter answer
+# + a confidence value, all wrapped in the same XML tags the strict parser
+# already expects. This raises strict-format rate without changing any
+# training-time behaviour.
+# ---------------------------------------------------------------------------
+
+OOD_USER_TEMPLATE = (
+    "{question}\n\n"
+    "This is a multiple-choice question. Choose ONE option.\n"
+    "Respond in EXACTLY this format:\n"
+    "<reasoning>one or two sentences</reasoning>\n"
+    "<answer>LETTER</answer>\n"
+    "<confidence>0.XX</confidence>\n"
+    "LETTER must be a single letter from A-E. "
+    "Confidence must be a number between 0.0 and 1.0."
 )
 
 GENERATORS = {
@@ -210,11 +239,23 @@ def run_ood_eval(
     tokenizer,
     ood_dir: Path,
     system_prompt: str,
-    user_template: str,
+    user_template: str,  # kept for backward-compat; OOD uses its own template
     max_new_tokens: int,
     response_fn=None,
 ) -> dict:
-    """Run OOD evaluation on medical and legal jsonl files."""
+    """Run OOD evaluation on medical and legal jsonl files.
+
+    Differences vs in-distribution eval (intentional, OOD-only):
+      * Uses an MCQ-specific user template so the model knows to emit a
+        single letter answer in the HONEST XML format.
+      * Parses with ``parse_action_lenient`` — still tries the strict
+        contract first, then falls back to a best-effort recovery so prose
+        answers still contribute to accuracy / calibration metrics.
+      * Grades with ``verify_mcq`` so letter-vs-index mismatches between
+        the jsonl ground-truth and the model's answer don't count as wrong.
+      * ``format_valid`` remains defined as "strict parser succeeded", so
+        the format-rate metric stays honest and comparable with training.
+    """
     _generate = response_fn or generate_response
     results   = {}
 
@@ -239,37 +280,53 @@ def run_ood_eval(
                 tokenizer,
                 question,
                 system_prompt=system_prompt,
-                user_template=user_template,
+                user_template=OOD_USER_TEMPLATE,
                 max_new_tokens=max_new_tokens,
             )
-            parsed       = parse_action(raw)
+
+            parsed = parse_action_lenient(raw)
+            parsed_mode = parsed.get("parsed_mode")  # "strict" | "lenient" | "lenient_default_conf" | None
+            strict_valid = parsed_mode == "strict" and parsed["type"] in ("answer", "abstain")
 
             correct: Optional[bool] = None
             confidence: Optional[float] = None
 
-            reward, correct = compute_reward(parsed, ground_truth, difficulty=5, domain=None)
-
             if parsed["type"] == "answer":
-                confidence = parsed["confidence"]
+                correct = verify_mcq(parsed["answer"], ground_truth)
+                confidence = float(parsed["confidence"])
+                target = 1.0 if correct else 0.0
+                brier = -1.5 * ((confidence - target) ** 2)
+                # Only grant the strict-format bonus when the strict parser accepted the output.
+                reward = brier + (FORMAT_BONUS if strict_valid else 0.0)
             elif parsed["type"] == "abstain":
                 confidence = 0.0
+                reward = 0.0
+            else:
+                reward = -1.0  # MALFORMED_PENALTY, preserves prior semantics
 
             records.append({
                 "question":     question[:200],
                 "ground_truth": ground_truth,
                 "raw_response": raw[:200],
                 "parsed_type":  parsed["type"],
+                "parsed_mode":  parsed_mode,  # extra bookkeeping; safe to ignore
+                "recovered":    parsed_mode in ("lenient", "lenient_default_conf"),
                 "correct":      correct,
                 "confidence":   confidence,
                 "reward":       reward,
-                "format_valid": parsed["type"] in ("answer", "abstain"),
+                "format_valid": strict_valid,
                 "source":       row.get("source", domain),
             })
 
         result  = _evaluate_records(records)
+        # Lightweight recovery stats for printed summary (non-breaking).
+        n_recovered = sum(1 for r in records if r.get("recovered"))
         elapsed = time.time() - t0
-        print(f"acc={result['accuracy']:.1%}  fmt={result['format_rate']:.1%}  "
-              f"brier={result['brier']:.4f}  ece={result['ece']:.4f}  [{elapsed:.1f}s]")
+        print(
+            f"acc={result['accuracy']:.1%}  fmt(strict)={result['format_rate']:.1%}  "
+            f"recovered={n_recovered}/{len(records)}  "
+            f"brier={result['brier']:.4f}  ece={result['ece']:.4f}  [{elapsed:.1f}s]"
+        )
         results[domain] = result
 
     return results

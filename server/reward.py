@@ -197,3 +197,140 @@ def reward_accuracy(
     return rewards
 
 # NOTE: reward_anti_hedge has been DELETED to prevent the 0.7 confidence exploit.
+
+
+# ---------------------------------------------------------------------------
+# Lenient EVAL-ONLY parser
+#
+# Training rewards MUST continue to use the strict `parse_action` above — it
+# is the anti-cheat gate that prevents a "reasoning bypass" exploit. This
+# lenient variant is intended ONLY for evaluation (e.g. OOD MCQ datasets
+# where the model may emit prose instead of the exact XML contract). It never
+# loosens anything for the training pipeline.
+#
+# Behaviour:
+#   1. Strict parser first. If it succeeds, return its result with
+#      parsed_mode="strict" (untouched semantics).
+#   2. Otherwise try a best-effort recovery:
+#        - <answer>...</answer> tag
+#        - "Answer: X" / "final answer is X" / "option (X) is correct"
+#        - last "(A)"-style MCQ marker
+#      and for confidence:
+#        - <confidence>...</confidence>
+#        - "80% confident" / "confidence: 0.8" / "I am 0.8 confident"
+#   3. If no answer is recoverable → still "malformed" (fail closed).
+#   4. If an answer is recovered but no confidence → neutral prior 0.5 and
+#      parsed_mode="lenient_default_conf", so downstream calibration metrics
+#      stay honest (the reward path below never grants the +0.15 FORMAT_BONUS
+#      to lenient-parsed answers).
+# ---------------------------------------------------------------------------
+
+_LENIENT_ANSWER_TAG_RE = re.compile(
+    r"<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE
+)
+_LENIENT_CONF_TAG_RE = re.compile(
+    r"<confidence>\s*([0-9]*\.?[0-9]+)\s*</confidence>", re.IGNORECASE
+)
+_LENIENT_ABSTAIN_RE = re.compile(r"<abstain\s*/?>", re.IGNORECASE)
+
+# Ordered list of answer-recovery patterns. Each must have exactly one capture
+# group containing the raw answer token.
+_LENIENT_ANSWER_PATTERNS = [
+    re.compile(r"(?im)^\s*(?:the\s+)?(?:final\s+)?answer\s*(?:is|:|\-)\s*\(?([A-Za-z0-9][^\n\.\)]{0,40}?)\)?\s*(?:\.|$|\n)"),
+    re.compile(r"(?im)\b(?:final\s+)?answer\s+is\s*\(?([A-E])\)?\b"),
+    re.compile(r"(?im)\bcorrect\s+(?:answer|option|choice)\s+is\s*\(?([A-E])\)?\b"),
+    re.compile(r"(?im)\boption\s+\(?([A-E])\)?\s+is\s+correct\b"),
+]
+# MCQ letter-in-parens fallback (e.g. "...the correct choice is (A).").
+_LENIENT_PARENS_LETTER_RE = re.compile(r"\(\s*([A-E])\s*\)")
+
+# Confidence recovery, in priority order.
+_LENIENT_CONF_PCT_RE = re.compile(r"([0-9]{1,3}(?:\.[0-9]+)?)\s*%\s*confiden", re.IGNORECASE)
+_LENIENT_CONF_KV_RE = re.compile(
+    r"(?i)confiden(?:ce|t)\s*(?:is|:|=|of|level)?\s*([0-9]*\.?[0-9]+)\s*(%?)"
+)
+
+
+def _extract_answer_lenient(text: str) -> Optional[str]:
+    m = _LENIENT_ANSWER_TAG_RE.search(text)
+    if m and m.group(1).strip():
+        return m.group(1).strip()
+
+    for pat in _LENIENT_ANSWER_PATTERNS:
+        matches = list(pat.finditer(text))
+        if matches:
+            cand = matches[-1].group(1).strip().rstrip(".,;:)")
+            if cand:
+                return cand
+
+    parens = list(_LENIENT_PARENS_LETTER_RE.finditer(text))
+    if parens:
+        return parens[-1].group(1).upper()
+
+    return None
+
+
+def _extract_confidence_lenient(text: str) -> Tuple[float, bool]:
+    """Return (confidence, found_explicit). If not found, returns (0.5, False)."""
+    m = _LENIENT_CONF_TAG_RE.search(text)
+    if m:
+        try:
+            return float(m.group(1)), True
+        except ValueError:
+            pass
+
+    m = _LENIENT_CONF_PCT_RE.search(text)
+    if m:
+        try:
+            return float(m.group(1)) / 100.0, True
+        except ValueError:
+            pass
+
+    m = _LENIENT_CONF_KV_RE.search(text)
+    if m:
+        try:
+            v = float(m.group(1))
+            if m.group(2) == "%" or v > 1.0:
+                v = v / 100.0
+            return v, True
+        except ValueError:
+            pass
+
+    return 0.5, False
+
+
+def parse_action_lenient(raw_text: str) -> dict:
+    """Eval-only parser. Tries strict ``parse_action`` first; on malformed,
+    attempts a best-effort recovery without weakening the training contract.
+
+    Returned dicts always contain a ``parsed_mode`` key for bookkeeping:
+        "strict"                - strict regex matched (identical to parse_action)
+        "lenient"               - recovered answer AND explicit confidence
+        "lenient_default_conf"  - recovered answer, no explicit confidence (0.5)
+    Malformed results do not carry parsed_mode.
+    """
+    if raw_text is None:
+        return {"type": "malformed"}
+
+    strict = parse_action(raw_text)
+    if strict["type"] != "malformed":
+        out = dict(strict)
+        out["parsed_mode"] = "strict"
+        return out
+
+    if _LENIENT_ABSTAIN_RE.search(raw_text):
+        return {"type": "abstain", "parsed_mode": "strict"}
+
+    ans = _extract_answer_lenient(raw_text)
+    if not ans:
+        return {"type": "malformed"}
+
+    conf, explicit = _extract_confidence_lenient(raw_text)
+    conf = max(0.0, min(1.0, float(conf)))
+
+    return {
+        "type": "answer",
+        "answer": ans,
+        "confidence": conf,
+        "parsed_mode": "lenient" if explicit else "lenient_default_conf",
+    }
