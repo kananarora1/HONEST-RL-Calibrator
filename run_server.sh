@@ -17,9 +17,10 @@ WORKERS="${WORKERS:-1}"
 LOG_LEVEL="${LOG_LEVEL:-info}"
 
 echo "Starting HONEST-Env server on http://${HOST}:${PORT} ..."
-echo "  Docs:   http://localhost:${PORT}/docs"
-echo "  Health: http://localhost:${PORT}/health"
-echo "  Info:   http://localhost:${PORT}/info"
+echo "  Docs:     http://localhost:${PORT}/docs"
+echo "  Health:   http://localhost:${PORT}/health"
+echo "  Metadata: http://localhost:${PORT}/metadata"
+echo "  Schema:   http://localhost:${PORT}/schema"
 echo ""
 
 cd "$SCRIPT_DIR"

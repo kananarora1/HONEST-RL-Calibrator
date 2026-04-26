@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 
-SUPPORTED_PRESETS = ("qwen7b", "llama3b", "phi4mini")
+SUPPORTED_PRESETS = ("qwen3b", "llama3b", "phi4mini")
 REASONING_MODES = ("required",)
 
 
@@ -29,7 +29,7 @@ class CalibrationPreset:
     All values are research-justified for short calibration RL runs
     (≤ 400 GRPO steps, single LoRA stage). They are NOT general SFT
     defaults — they are tuned for stable Brier-score gradients on
-    Qwen-7B / Llama-3B / Phi-4-mini under the committed reward scheme
+    Qwen-3B / Llama-3B / Phi-4-mini under the committed reward scheme
     in ``server/reward.py`` (Brier scale -1.5, FORMAT_BONUS 0.15,
     accuracy bonus +0.85 / -0.15).
 
@@ -83,31 +83,36 @@ class CalibrationPreset:
 
 MODEL_PRESETS: Dict[str, CalibrationPreset] = {
     # ─────────────────────────────────────────────────────────────────────
-    # Qwen2.5-7B-Instruct  →  A100 40 GB
-    # Strong baseline reasoning (~60 % acc on diff-2/3) → Brier gradient is
-    # rich from early steps. We can afford fewer rollouts (G=8) and a
-    # slightly higher beta (0.05) because the policy doesn't drift much.
-    # Format weight kept at 1.0 because Qwen format-compliance locks in
-    # within ~30 steps; over-weighting format would crowd out the Brier
-    # gradient. Accuracy weight 1.0 keeps the +0.85/-0.15 correctness
-    # incentive symmetric with the Brier signal magnitude (-1.5..+0.15).
+    # Qwen2.5-3B-Instruct  →  L4 24 GB (recommended) / A10G 24 GB
+    # Strong reasoning per parameter (~50-55 % acc on diff-2/3) but rollouts
+    # are noisier than at 7B, so we bump G from 8 → 10 to stabilize the
+    # GRPO advantage normalization. lr is lifted to 2e-6 (smaller models
+    # tolerate steeper updates and Qwen is the most LR-stable of the trio);
+    # beta drops to 0.04 because the smaller policy drifts naturally — a
+    # tighter beta would waste KL budget without adding stability. Format
+    # weight 1.0 because Qwen format-compliance locks in within ~30 steps
+    # even at 3B, so we don't crowd out the Brier gradient. Difficulty
+    # mixture shifts slightly easier than the 7B preset (more 1-2, less
+    # 4-5) because the per-rollout reward signal is noisier on harder
+    # problems and 3B can't reliably extract a calibration gradient from
+    # the long tail.
     # ─────────────────────────────────────────────────────────────────────
-    "qwen7b": CalibrationPreset(
-        name="qwen7b",
-        model_hint="Qwen/Qwen2.5-7B-Instruct",
+    "qwen3b": CalibrationPreset(
+        name="qwen3b",
+        model_hint="Qwen/Qwen2.5-3B-Instruct",
         domain_weights={"math": 0.50, "code": 0.35, "logic": 0.15},
-        difficulty_weights={1: 0.20, 2: 0.35, 3: 0.30, 4: 0.10, 5: 0.05},
+        difficulty_weights={1: 0.25, 2: 0.35, 3: 0.25, 4: 0.10, 5: 0.05},
         default_prompt_dataset_size=3500,
-        default_num_generations=8,
+        default_num_generations=10,
         default_max_completion_length=512,
-        default_temperature=0.80,
-        default_learning_rate=1.5e-6,
-        default_beta=0.05,
+        default_temperature=0.85,
+        default_learning_rate=2.0e-6,
+        default_beta=0.04,
         default_lora_r=32,
-        default_max_steps=300,
+        default_max_steps=350,
         reward_format_weight=1.0,
         reward_accuracy_weight=1.0,
-        beta_end=0.02,
+        beta_end=0.015,
         kl_relax_frac=0.50,
         default_initial_target=2,
     ),
@@ -171,10 +176,10 @@ MODEL_PRESETS: Dict[str, CalibrationPreset] = {
 
 
 def infer_preset_name(model_id: str) -> str:
-    """Infer preset from model id; defaults to qwen7b for unknown ids."""
+    """Infer preset from model id; defaults to qwen3b for unknown ids."""
     m = (model_id or "").lower()
-    if "qwen" in m and "7b" in m:
-        return "qwen7b"
+    if "qwen" in m and "3b" in m:
+        return "qwen3b"
     if "llama" in m and "3b" in m:
         return "llama3b"
     if "phi-4-mini" in m or ("phi" in m and "mini" in m):
@@ -182,7 +187,7 @@ def infer_preset_name(model_id: str) -> str:
     # Legacy fallback: many users still run phi-3.5-mini
     if "phi-3.5" in m or "phi3.5" in m:
         return "phi4mini"
-    return "qwen7b"
+    return "qwen3b"
 
 
 def get_preset(model_id: str, preset_override: str = "auto") -> CalibrationPreset:
