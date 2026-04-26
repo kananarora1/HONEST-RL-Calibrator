@@ -110,7 +110,10 @@ def _load_dataset_rows() -> Iterator[Tuple[str, dict]]:
             return
         except Exception as exc:  # noqa: BLE001 — we want to try the next
             last_error = exc
-            print(f"[ingest_hendrycks_math] {name} failed: {exc}", file=sys.stderr)
+            print(
+                f"[ingest_hendrycks_math] {name} not available ({exc}); trying next candidate…",
+                file=sys.stderr,
+            )
     raise RuntimeError("No Hendrycks MATH dataset could be loaded") from last_error
 
 

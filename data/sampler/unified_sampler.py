@@ -260,13 +260,40 @@ def get_sampler() -> UnifiedSampler:
 
 
 def generate_math(difficulty: int, seed: Optional[int] = None) -> Tuple[str, str, str]:
-    """Module-level shim — returns (question, canonical_answer, problem_id)."""
-    return get_sampler().math_generate(difficulty, seed)
+    """Module-level shim — returns (question, canonical_answer, problem_id).
+
+    Falls back to the procedural math generator for any difficulty whose curated
+    bucket is empty (e.g. when Hendrycks-MATH has not been ingested yet), so the
+    correct difficulty level is always served.
+    """
+    sampler = get_sampler()
+    key = ("math", difficulty)
+    if sampler._buckets.get(key):
+        return sampler.math_generate(difficulty, seed)
+
+    from server.generators import math_gen as _procedural_math
+    question, answer = _procedural_math.generate(difficulty, seed=seed)
+    problem_id = f"procedural_math_d{difficulty}_{hash(question) & 0xFFFFFFFF:08x}"
+    return question, answer, problem_id
 
 
 def generate_code(difficulty: int, seed: Optional[int] = None) -> Tuple[str, str, str]:
-    """Module-level shim — returns (question, canonical_answer, problem_id)."""
-    return get_sampler().code_generate(difficulty, seed)
+    """Module-level shim — returns (question, canonical_answer, problem_id).
+
+    Falls back to the procedural code generator for any difficulty whose curated
+    bucket is empty (mirrors the logic domain's handling of d=1–2).  This avoids
+    the 'falling back to difficulty=2' warning when APPS (d=3–5) has not been
+    ingested yet, and provides a well-formed problem at the *correct* difficulty.
+    """
+    sampler = get_sampler()
+    key = ("code", difficulty)
+    if sampler._buckets.get(key):
+        return sampler.code_generate(difficulty, seed)
+
+    from server.generators import code_gen as _procedural_code
+    question, answer = _procedural_code.generate(difficulty, seed=seed)
+    problem_id = f"procedural_code_d{difficulty}_{hash(question) & 0xFFFFFFFF:08x}"
+    return question, answer, problem_id
 
 
 def generate_logic(difficulty: int, seed: Optional[int] = None) -> Tuple[str, str, str]:

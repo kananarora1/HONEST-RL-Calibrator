@@ -1,10 +1,19 @@
 """Ingest the APPS competitive-programming dataset into unified JSONL.
 
-Streams ``codeparrot/apps`` (the full dataset is ~10 GB, so streaming is
-required) and writes :class:`UnifiedProblem` records to
-``data/processed/code_apps.jsonl``. Progress is flushed every 500
-records, and the script skips already-written ``problem_id``s on restart
-so it can resume after a failure.
+The Hugging Face dataset card ``codeparrot/apps`` still ships a Python
+loading script (``apps.py``). Recent ``datasets`` versions reject those
+scripts, so we **stream the published JSONL shards directly** from the Hub
+(``train.jsonl`` / ``test.jsonl``) via HTTPS — same rows, no
+``trust_remote_code`` / no ``load_dataset("codeparrot/apps", ...)``.
+
+The full train split is large (~10 GB); ingestion streams line-by-line.
+
+Each JSONL row uses the numeric field ``id`` (not ``problem_id``) as the
+stable problem key. Rows whose ``input_output`` lists are both empty are
+skipped (they are not stdin/stdout verifiable with this pipeline).
+
+If a previous run wrote ``apps_*_unknown`` ids, delete ``code_apps.jsonl``
+and re-ingest.
 
 Difficulty mapping:
 
@@ -20,48 +29,87 @@ Run directly::
 from __future__ import annotations
 
 import json
+import os
 import sys
+import urllib.error
+import urllib.request
 from collections import Counter
 from pathlib import Path
-from typing import Iterable, Iterator, Optional, Tuple
+from typing import Any, Iterable, Iterator, List, Optional, Tuple
 
 from data.schema import UnifiedProblem
 
 
-_DATASET_NAME = "codeparrot/apps"
+_HUB_JSONL_BASE = (
+    "https://huggingface.co/datasets/codeparrot/apps/resolve/main"
+)
 _DIFFICULTY_MAP = {"introductory": 3, "interview": 4, "competition": 5}
 _CHECKPOINT_INTERVAL = 500
 
 
-def _load_rows_streaming() -> Iterator[Tuple[str, dict]]:
-    from datasets import load_dataset  # type: ignore[import-not-found]
+def _open_apps_jsonl(split: str):
+    """Return a binary HTTP response for ``{split}.jsonl`` (caller must close)."""
+    url = f"{_HUB_JSONL_BASE}/{split}.jsonl"
+    headers = {"User-Agent": "HONEST-RL-Calibrator-ingest/1.0 (APPS JSONL stream)"}
+    token = (os.environ.get("HF_TOKEN") or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers)
+    return urllib.request.urlopen(req, timeout=600)
 
+
+def _load_rows_streaming() -> Iterator[Tuple[str, dict]]:
     for split in ("train", "test"):
         try:
-            ds = load_dataset(
-                _DATASET_NAME, split=split, streaming=True, trust_remote_code=True
+            with _open_apps_jsonl(split) as resp:
+                while True:
+                    raw = resp.readline()
+                    if not raw:
+                        break
+                    line = raw.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(row, dict):
+                        yield split, row
+        except urllib.error.HTTPError as exc:
+            print(
+                f"[ingest_apps] HTTP {exc.code} opening {split}.jsonl: {exc.reason}",
+                file=sys.stderr,
             )
         except Exception as exc:
-            print(f"[ingest_apps] failed to open split {split}: {exc}", file=sys.stderr)
-            continue
-        for row in ds:
-            yield split, row
+            print(f"[ingest_apps] failed to stream split {split}: {exc}", file=sys.stderr)
 
 
-def _normalize_io(raw_io: str) -> Optional[Tuple[list, list]]:
-    """Parse APPS's ``input_output`` JSON blob into ``(inputs, outputs)``.
+def _parse_input_output_blob(raw_io: Any) -> Optional[dict]:
+    """Return a dict with ``inputs`` / ``outputs`` lists, or ``None``."""
+    if raw_io is None:
+        return None
+    if isinstance(raw_io, dict):
+        return raw_io
+    if isinstance(raw_io, str):
+        if not raw_io.strip():
+            return None
+        try:
+            parsed = json.loads(raw_io)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
 
-    Returns ``None`` if the blob is missing, empty, or malformed, or if
-    the shapes don't line up.
+
+def _resolve_io_pairs(blob: dict) -> Optional[Tuple[List[Any], List[Any]]]:
+    """Return ``(inputs, outputs)`` for stdin_stdout verification, or ``None``.
+
+    Rows with both lists empty (many APPS ``interview`` / ``competition``
+    generator tasks) are skipped: they would require a custom checker or an
+    expensive reference run at ingest time.
     """
-    if not raw_io or not isinstance(raw_io, str):
-        return None
-    try:
-        parsed = json.loads(raw_io)
-    except (json.JSONDecodeError, ValueError):
-        return None
-    inputs = parsed.get("inputs")
-    outputs = parsed.get("outputs")
+    inputs = blob.get("inputs")
+    outputs = blob.get("outputs")
     if not isinstance(inputs, list) or not isinstance(outputs, list):
         return None
     if not inputs or len(inputs) != len(outputs):
@@ -99,20 +147,26 @@ def _row_to_problem(split: str, row: dict) -> Optional[UnifiedProblem]:
     if difficulty is None:
         return None
 
-    io = _normalize_io(row.get("input_output") or "")
-    if io is None:
-        return None
-    inputs, outputs = io
-
     solution = _first_solution(row.get("solutions") or "")
     if solution is None:
         return None
+
+    blob = _parse_input_output_blob(row.get("input_output"))
+    if blob is None:
+        return None
+    io_pair = _resolve_io_pairs(blob)
+    if io_pair is None:
+        return None
+    inputs, outputs = io_pair
 
     question_text = _build_question(row.get("question") or "", row.get("starter_code") or "")
     if not question_text:
         return None
 
+    # Hub JSONL uses ``id``; older HF dataset dicts used ``problem_id``.
     raw_pid = row.get("problem_id")
+    if raw_pid is None:
+        raw_pid = row.get("id")
     try:
         pid_int = int(raw_pid)
         pid_str = f"{pid_int:05d}"
@@ -173,6 +227,14 @@ def ingest(
     if seen:
         print(
             f"[ingest_apps] resuming: {len(seen)} problems already in {out}",
+            file=sys.stderr,
+        )
+    bad_unknown = sum(1 for pid in seen if str(pid).endswith("_unknown"))
+    if bad_unknown:
+        print(
+            f"[ingest_apps] WARNING: {bad_unknown} stale id(s) ending in '_unknown' "
+            f"(Hub JSONL uses `id`, not `problem_id`).\n"
+            f"  Fix: rm -f {out} && PYTHONPATH=. python -m data.ingestion.ingest_apps",
             file=sys.stderr,
         )
 

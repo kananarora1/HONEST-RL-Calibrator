@@ -333,8 +333,6 @@ def _try_generate_puzzle(
     rng: random.Random,
 ) -> Optional[Tuple[Dict[int, Dict[str, str]], List[Tuple], Dict[str, List[str]]]]:
     """Attempt to generate a minimal-clue puzzle.  Returns None on failure."""
-    import z3  # noqa: F401 — ensure z3 importable early
-
     feature_values = {
         feat: rng.sample(FEATURE_POOLS[feat], n_houses) for feat in features
     }
@@ -403,6 +401,21 @@ def _puzzle_to_record(
 # Generation plan
 # ---------------------------------------------------------------------------
 
+
+def _require_z3() -> None:
+    """Fail fast with a clear message (package name is ``z3-solver`` on PyPI)."""
+    try:
+        import z3  # noqa: F401
+    except ImportError as exc:
+        print(
+            "[regenerate_zebralogic] Missing the Z3 Python bindings (`import z3`).\n"
+            "  pip install z3-solver\n"
+            "Then re-run this script.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2) from exc
+
+
 # (n_houses, n_features, difficulty, count)
 GENERATION_PLAN: List[Tuple[int, int, int, int]] = [
     # Difficulty 3: 3×3 and 3×4
@@ -438,6 +451,8 @@ def ingest(
     checkpoint_interval:
         Flush and print progress every N puzzles.
     """
+    _require_z3()
+
     if plan is None:
         plan = GENERATION_PLAN
 

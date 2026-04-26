@@ -588,7 +588,7 @@ def _warm_up_unified_sampler() -> None:
             "Run the ingestion scripts:\n"
             "  PYTHONPATH=. python data/ingestion/ingest_hendrycks_math.py\n"
             "  PYTHONPATH=. python data/ingestion/ingest_mbpp.py\n"
-            "  PYTHONPATH=. python data/ingestion/ingest_apps.py\n"
+            "  PYTHONPATH=. python -m data.ingestion.ingest_apps\n"
             "  PYTHONPATH=. python data/ingestion/regenerate_zebralogic.py\n"
         )
     counts = sampler.bucket_counts()
