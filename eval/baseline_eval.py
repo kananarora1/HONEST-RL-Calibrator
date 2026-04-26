@@ -294,7 +294,7 @@ def main():
     parser.add_argument(
         "--reasoning-mode",
         choices=list(REASONING_MODES),
-        default="optional",
+        default="required",
         help="Prompt mode to match training/eval style.",
     )
     parser.add_argument("--max-new-tokens", type=int, default=512,

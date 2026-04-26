@@ -13,7 +13,7 @@ from typing import Dict, List, Optional
 
 
 SUPPORTED_PRESETS = ("qwen7b", "llama3b", "phi4mini")
-REASONING_MODES = ("none", "optional", "required")
+REASONING_MODES = ("required",)
 
 
 @dataclass(frozen=True)
@@ -225,13 +225,12 @@ def parse_difficulty_csv(csv_text: Optional[str]) -> Optional[Dict[int, float]]:
 
 def prompt_templates(reasoning_mode: str) -> tuple[str, str]:
     """Return (system_prompt, user_template) for selected reasoning mode."""
-    mode = (reasoning_mode or "optional").lower()
+    mode = (reasoning_mode or "required").lower()
     if mode not in REASONING_MODES:
         valid = ", ".join(REASONING_MODES)
         raise ValueError(f"Invalid reasoning_mode '{reasoning_mode}'. Valid: {valid}")
 
-    if mode == "required":
-        system_prompt = """You are a precise and well-calibrated AI assistant.
+    system_prompt = """You are a precise and well-calibrated AI assistant.
 
 Respond in EXACTLY this format:
 <reasoning>
@@ -244,37 +243,8 @@ Rules:
 - Confidence must be between 0.0 and 1.0
 - If very unsure, output <abstain/>
 - Keep reasoning concise, then provide final answer and confidence."""
-        user_template = (
-            "{question}\n\n"
-            "Think briefly in <reasoning>, then provide <answer> and <confidence>."
-        )
-        return system_prompt, user_template
-
-    if mode == "none":
-        system_prompt = """You are a precise and well-calibrated AI assistant.
-
-Respond in EXACTLY this format:
-<answer>YOUR_ANSWER_HERE</answer><confidence>0.X</confidence>
-
-Rules:
-- Confidence must be between 0.0 and 1.0
-- If very unsure, output <abstain/>
-- Never output anything outside the XML tags."""
-        user_template = "{question}\n\nRespond only using the required XML format."
-        return system_prompt, user_template
-
-    # optional (recommended for fast/stable calibration RL)
-    system_prompt = """You are a precise and well-calibrated AI assistant.
-
-Required final output format:
-<answer>YOUR_ANSWER_HERE</answer><confidence>0.X</confidence>
-
-Rules:
-- Confidence must be between 0.0 and 1.0
-- If very unsure, output <abstain/>
-- You may think briefly before the tags when needed, but keep it short."""
     user_template = (
         "{question}\n\n"
-        "If needed, think briefly first. End with <answer> and <confidence>."
+        "Think briefly in <reasoning>, then provide <answer> and <confidence>."
     )
     return system_prompt, user_template
