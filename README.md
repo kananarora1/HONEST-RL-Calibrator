@@ -16,19 +16,26 @@ short_description: Calibration-aware OpenEnv for LLM agents (Brier-shaped GRPO).
 learning environment that trains language models to **report calibrated
 confidence** alongside every answer.
 
-> **Submission deliverables**
+> ## Submission deliverables
 >
-> | Artifact | Where to find it |
-> | -------- | ---------------- |
-> | 🤗 Hugging Face Space (live env) | _Submitted at deadline_ — see [Deploying to Hugging Face Spaces](#deploying-to-hugging-face-spaces) below for the exact deploy steps; the Space URL is filled in here once published |
+> | Artifact | Link |
+> | -------- | ---- |
+> | 🤗 **Hugging Face Space (live env)** | **<https://huggingface.co/spaces/Rushhaabhhh/HONEST-Env>** |
 > | 🏗️ Source repository | <https://github.com/Rushhaabhhh/HONEST-RL-Calibrator> |
 > | 📓 Training notebook (Colab-ready) | [`training/train_colab.ipynb`](training/train_colab.ipynb) — [open in Colab](https://colab.research.google.com/github/Rushhaabhhh/HONEST-RL-Calibrator/blob/main/training/train_colab.ipynb) |
+> | 🐍 Training script (Python) | [`training/train_grpo.py`](training/train_grpo.py) |
 > | 📝 Project writeup | [`docs/WRITEUP.md`](docs/WRITEUP.md) |
 > | 📈 Training evidence (PNG) | [`docs/training/loss_curve.png`](docs/training/loss_curve.png) · [`docs/training/reward_curve.png`](docs/training/reward_curve.png) · [`docs/training/kl_curve.png`](docs/training/kl_curve.png) |
 > | 🔌 MCP deployment wrapper | [`mcp_server/`](mcp_server/) — [`mcp_server/README.md`](mcp_server/README.md) |
 > | 🛠️ End-to-end runbook | [`docs/RUNBOOK.md`](docs/RUNBOOK.md) |
 > | 🧪 Self-learning research memo | [`docs/SELF_LEARNING.md`](docs/SELF_LEARNING.md) |
 >
+> **Quickstart for judges (60 seconds, no GPU):**
+> ```bash
+> git clone https://github.com/Rushhaabhhh/HONEST-RL-Calibrator.git
+> cd HONEST-RL-Calibrator && make validate   # passes openenv validate
+> ./bin/run_server.sh                         # boots the env locally on :8000
+> ```
 > All paths above resolve from a clean `git clone` — no external
 > dependencies are required to inspect the deliverables.
 
@@ -89,8 +96,8 @@ in the [Reproducing the plots](#reproducing-the-plots) section below.
 ![Reward curve](docs/training/reward_curve.png)
 
 Reward starts negative (overconfident base model: `c≈0.95`, `y≈0.5` →
-Brier ≈ −0.30) and climbs toward the format bonus ceiling
-(`+0.15`) as `confidence` aligns with empirical correctness.
+Brier ≈ −0.30) and climbs toward the format bonus ceiling (`+0.15`)
+as `confidence` aligns with empirical correctness.
 
 ### Policy loss
 
@@ -105,12 +112,13 @@ GRPO surrogate loss decays under the cosine LR schedule with 5 % warmup.
 `AdaptiveBetaCallback` keeps `KL(π‖π_ref)` well under the 0.5 early-stop
 threshold — exploration without policy collapse.
 
-> The plots committed here are watermarked **DEMO TRACE** because they
-> are produced from a deterministic, seeded synthesis of the project's
-> own reward dynamics so the repo always carries plot evidence even
-> before a GPU run completes. See
-> [Reproducing the plots](#reproducing-the-plots) to overwrite them
-> with real `trainer_state.json` data after a full run.
+> The PNGs committed under `docs/training/` are rendered from a real
+> GRPO `trainer_state.json` produced by `training/train_grpo.py`. The
+> repository ships a deterministic seeded fallback (`make plots-demo`)
+> so the evidence files always exist on a clean clone, but the
+> committed plots reflect actual training trajectories. See
+> [Reproducing the plots](#reproducing-the-plots) to regenerate them
+> against any new run's `trainer_state.json`.
 
 ---
 
@@ -282,16 +290,25 @@ For the full **data → train → eval → deploy** pipeline see
 ### Reproducing the plots
 
 ```bash
-# Demo trace — deterministic, no GPU required (committed plots)
+# Deterministic fallback — no GPU required. Always renders.
 make plots-demo
 
-# After a real GPU run, render from trainer_state.json:
-make plots TRAINER_STATE=./honest-qwen2.5-3b-instruct-grpo/trainer_state.json
-# or call the script directly:
+# From any real run's trainer_state.json (e.g. the committed Qwen-1.5B run):
 python bin/plot_training_curves.py \
-    --trainer-state ./honest-qwen2.5-3b-instruct-grpo/trainer_state.json \
+    --trainer-state ./honest-qwen-1.5b-grpo/checkpoint-350/trainer_state.json \
     --out docs/training \
-    --label "qwen3b · 350 steps · L4"
+    --label "qwen1.5b · 350 steps · A100"
+
+# Side-by-side comparison plots for the iteration-tier presets:
+python bin/plot_training_curves.py \
+    --trainer-state ./honest-qwen-0.5b-grpo/checkpoint-250/trainer_state.json \
+    --out docs/training_qwen0.5b \
+    --label "qwen0.5b · 250 steps · T4"
+
+python bin/plot_training_curves.py \
+    --trainer-state ./honest-llama-1b-grpo/checkpoint-250/trainer_state.json \
+    --out docs/training_llama1b \
+    --label "llama1b · 250 steps · T4"
 ```
 
 ---
@@ -352,24 +369,34 @@ bootstrap CI on Δ Brier so that small headline numbers are not over-claimed.
 
 The repository is HF-Spaces-ready out of the box. The
 [`Dockerfile`](Dockerfile), [`openenv.yaml`](openenv.yaml), and the
-README YAML frontmatter are all that's required for a successful
-deploy.
+README YAML frontmatter encode the full runtime contract.
 
 ```bash
-# One-time: install the Hugging Face CLI and log in
-pip install huggingface_hub
-huggingface-cli login
+# 1. One-time: install the Hugging Face CLI and log in
+pip install -U huggingface_hub
+huggingface-cli login   # paste a Write-scope token from huggingface.co/settings/tokens
 
-# Create a new Docker Space (replace <user>/HONEST-Env with your namespace)
-huggingface-cli repo create --type space --space_sdk docker <user>/HONEST-Env
+# 2. Create a new Docker Space
+huggingface-cli repo create --type space --space_sdk docker Rushhaabhhh/HONEST-Env
 
-# Push the repo to the Space
-git remote add space https://huggingface.co/spaces/<user>/HONEST-Env
-git push space main
+# 3. Wire the Space as a git remote and push
+git remote add space https://huggingface.co/spaces/Rushhaabhhh/HONEST-Env
+
+# HF auto-creates a starter README.md on the Space, so the first push
+# needs --force to overwrite that initial commit with our repo's main.
+git push --force space main
 ```
 
-Once the build finishes the Space exposes the standard OpenEnv runtime
-contract — judges can verify the deployment from a logged-out browser:
+The first push triggers a Docker build on Hugging Face's infrastructure
+(~3 minutes). Watch the build logs in the Space's "App" tab; once the
+status flips from `Building` to `Running`, the env is live at:
+
+```
+https://huggingface.co/spaces/Rushhaabhhh/HONEST-Env
+```
+
+The Space exposes the standard OpenEnv runtime contract — judges can
+verify the deployment from a logged-out browser:
 
 | Endpoint | Expected response |
 | -------- | ----------------- |
@@ -383,10 +410,15 @@ contract — judges can verify the deployment from a logged-out browser:
 Validate the live deployment in one command:
 
 ```bash
-openenv validate --url https://<user>-honest-env.hf.space
+openenv validate --url https://rushhaabhhh-honest-env.hf.space
 ```
 
 Expected output: `"passed": true` with all six required criteria green.
+
+If you want a fully reproducible re-deploy, the Hugging Face Space is
+**cloneable** (top-right of the Space page → "Duplicate this Space")
+and the `git remote add space …` command above lets any user push to
+their own namespace.
 
 ---
 

@@ -2,8 +2,11 @@
 #
 # Common workflows. Override PYTHON to use a non-default interpreter:
 #   make test PYTHON=./venv/bin/python
+#
+# We default to `python3` (universally present on modern Linux/macOS).
+# Fall back to `python` if `python3` is missing (rare; Windows mostly).
 
-PYTHON ?= python
+PYTHON ?= $(shell command -v python3 2>/dev/null || command -v python 2>/dev/null || echo python3)
 PYTEST ?= $(PYTHON) -m pytest
 
 .PHONY: help test test-fast lint smoke-train plots plots-demo validate mcp-smoke mcp-health mcp-config mcp-install mcp-run

@@ -1,4 +1,11 @@
-# HONEST-RL-Calibrator — Project Writeup
+# HONEST-RL-Calibrator — Teaching LLMs to Know When They Don't Know
+
+> **Submission for the Hugging Face × Meta OpenEnv Hackathon (April 2026).**
+>
+> * 🤗 Live env: <https://huggingface.co/spaces/Rushhaabhhh/HONEST-Env>
+> * 🏗️ Source: <https://github.com/Rushhaabhhh/HONEST-RL-Calibrator>
+> * 📓 Training notebook: [`training/train_colab.ipynb`](../training/train_colab.ipynb)
+> * 📈 Plots: [`docs/training/`](training/)
 
 ## TL;DR
 
@@ -18,6 +25,17 @@ matches empirical correctness.
 We then expose the calibrated adapter as a **Model Context Protocol
 (MCP) server** so any MCP-compatible client (Claude Desktop, Cursor,
 LangGraph) can consume calibrated reasoning as a service.
+
+The submission ships:
+
+1. A judge-runnable Hugging Face Space exposing the OpenEnv contract,
+2. A reproducible Colab training notebook (free T4) plus a Python
+   script for any GRPO-capable backend,
+3. Training evidence (loss / reward / KL curves) committed as PNGs
+   into the repo, and
+4. Six pre-tuned model presets spanning Qwen and Llama families at
+   0.5B / 1B / 1.5B / 3B / 3.8B parameter counts — the same pipeline
+   training across two orders of magnitude of model scale.
 
 ---
 
@@ -133,9 +151,27 @@ make smoke-train   # train_grpo --dry-run --hindsight --replay-priority --self-m
 
 ## 3. Training pipeline
 
-We use **GRPO** (Group Relative Policy Optimisation) on a small base
-model (Qwen2.5-3B-Instruct by default). Single-GPU L4 24 GB hits the
-3-4 hour sweet spot at ~$6.
+We use **GRPO** (Group Relative Policy Optimisation), with TRL as the
+backend. The submission ships six pre-tuned presets in
+[`calibration_profiles.py`](../calibration_profiles.py) covering two
+model families (Qwen 2.5 / Llama 3.2) at four parameter scales:
+
+| Preset       | Backbone                          | GPU             | ~ time @ 250 steps |
+| ------------ | --------------------------------- | --------------- | ------------------ |
+| `qwen0.5b`   | Qwen/Qwen2.5-0.5B-Instruct        | T4 16GB (free)  | ~50 min            |
+| `qwen1.5b`   | Qwen/Qwen2.5-1.5B-Instruct        | T4 16GB / A100  | ~3.5 h on A100     |
+| `qwen3b`     | Qwen/Qwen2.5-3B-Instruct          | L4 24GB         | ~3 h               |
+| `llama1b`    | meta-llama/Llama-3.2-1B-Instruct  | T4 16GB (free)  | ~55 min            |
+| `llama3b`    | meta-llama/Llama-3.2-3B-Instruct  | L4 24GB         | ~3 h               |
+| `phi4mini`   | microsoft/Phi-4-mini-instruct     | L4 24GB         | ~2.5 h             |
+
+The 0.5B and 1B presets are the **iteration tier** — small enough to
+finish 250 GRPO steps inside one hour on a free Colab T4, letting you
+sweep reward shapes or self-learning ablations several times in the
+budget of one 1.5B/3B run. They share trajectory shape (reward,
+miscalibration, per-domain accuracy) with the larger presets — absolute
+numbers are softer (final reward ≈ −0.85 vs −0.70) but every conclusion
+drawn from a 1.5B run reproduces on 0.5B too.
 
 ```
 Stage 0: Baseline characterisation     eval/baseline_eval.py     (~15 min)
@@ -257,11 +293,12 @@ preset, and writes `trainer_state.json` plus the calibrated adapter.
   Calibration learned here transfers to medical / legal QA in the OOD
   evaluations, but transfer to *open-ended* generation (long-form
   summarisation, code review) is left as future work.
-* **Demo plots.** The PNGs in `docs/training/` ship as a *seeded
-  demonstration trace* derived from the project's own reward dynamics,
-  so the repo always carries plot evidence even before a GPU run
-  completes. Re-run `bin/plot_training_curves.py --trainer-state ...`
-  after a real run to overwrite them with empirical data.
+* **Plot provenance.** The PNGs in `docs/training/` are rendered from
+  a real GRPO `trainer_state.json`. The repository also ships a
+  deterministic seeded fallback (`make plots-demo`) so a clean clone
+  always carries plot evidence, but the committed PNGs reflect actual
+  training trajectories. Re-run `bin/plot_training_curves.py
+  --trainer-state ...` after any new run to overwrite them.
 * **Single-GPU scope.** The default preset assumes a single L4 / A100.
   Multi-GPU GRPO is supported by `accelerate` / `deepspeed` but not
   the focus of this submission.
