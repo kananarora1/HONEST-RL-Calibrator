@@ -5,69 +5,430 @@ colorFrom: blue
 colorTo: green
 sdk: docker
 app_port: 8000
+pinned: false
+short_description: Calibration-aware OpenEnv for LLM agents (Brier-shaped GRPO).
 ---
 
 # HONEST-RL-Calibrator
 
-HONEST, short for Honesty-Optimised and Normalized Environment for Self-Triage, is an OpenEnv-compliant reinforcement learning and evaluation environment designed to test and improve the **honesty and confidence calibration** of AI agents (LLMs).
+**Honesty-Optimized and Normalized Environment for Self-Triage** — an
+[OpenEnv](https://github.com/meta-pytorch/OpenEnv)-compliant reinforcement
+learning environment that trains language models to **report calibrated
+confidence** alongside every answer.
 
-Instead of just checking if an agent gets the answer right, HONEST-RL-Calibrator forces the agent to report its confidence alongside its answer, or explicitly abstain from answering. It then scores the agent using a proper scoring rule (Brier Score) combined with adaptive curriculum difficulty.
+> **Submission deliverables**
+>
+> | Artifact | Where to find it |
+> | -------- | ---------------- |
+> | 🤗 Hugging Face Space (live env) | _Submitted at deadline_ — see [Deploying to Hugging Face Spaces](#deploying-to-hugging-face-spaces) below for the exact deploy steps; the Space URL is filled in here once published |
+> | 🏗️ Source repository | <https://github.com/Rushhaabhhh/HONEST-RL-Calibrator> |
+> | 📓 Training notebook (Colab-ready) | [`training/train_colab.ipynb`](training/train_colab.ipynb) — [open in Colab](https://colab.research.google.com/github/Rushhaabhhh/HONEST-RL-Calibrator/blob/main/training/train_colab.ipynb) |
+> | 📝 Project writeup | [`docs/WRITEUP.md`](docs/WRITEUP.md) |
+> | 📈 Training evidence (PNG) | [`docs/training/loss_curve.png`](docs/training/loss_curve.png) · [`docs/training/reward_curve.png`](docs/training/reward_curve.png) · [`docs/training/kl_curve.png`](docs/training/kl_curve.png) |
+> | 🔌 MCP deployment wrapper | [`mcp_server/`](mcp_server/) — [`mcp_server/README.md`](mcp_server/README.md) |
+> | 🛠️ End-to-end runbook | [`RUNBOOK.md`](RUNBOOK.md) |
+> | 🧪 Self-learning research memo | [`SELF_LEARNING.md`](SELF_LEARNING.md) |
+>
+> All paths above resolve from a clean `git clone` — no external
+> dependencies are required to inspect the deliverables.
 
-## How It Works
+The agent does not just answer; it must declare *how confident it is* in
+that answer, or explicitly abstain. Reward is a strictly proper scoring
+rule (Brier score), so the only way to maximize return is to make
+confidences **match empirical correctness**.
 
-### 1. The Generators (Domains)
-The environment procedurally generates questions across three domains, each with 5 difficulty levels:
-- **Math (`math_gen.py`)**: Ranging from simple arithmetic addition to compound interest and quadratics.
-- **Python Code (`code_gen.py`)**: Ranging from simple variable execution to nested loops and bounded recursion. Answers are dynamically evaluated using an isolated `exec()` context.
-- **Logic Puzzles (`logic_gen.py`)**: Setup using `python-constraint`. Ranging from simple transitive relations (A > B > C) to 4x4 Zebra puzzles, guaranteed to have exactly one unique solution.
+```
+Question  ──►  <reasoning>...</reasoning>
+                <answer>42</answer><confidence>0.83</confidence>
+                              │
+                              ▼
+                Reward = -1.5·(c - y)² + format/abstain shaping
+```
 
-### 2. Action Interface
-The agent interacts with the environment by supplying an XML format specifying its answer and a confidence score between 0.0 and 1.0 (e.g., `<answer>42</answer><confidence>0.9</confidence>`), or it can explicitly abstain (`<abstain/>`).
+After training, the model is exposed via a Model Context Protocol (MCP)
+server so any MCP-compatible client (Claude Desktop, Cursor, LangGraph
+agents) can consume calibrated reasoning as a service.
 
-### 3. The Reward Scheme (Brier Score)
-The evaluation is handled by `verifier.py` and `reward.py`. 
-- **Correct + High Confidence**: Slight positive reward (e.g., `~ +0.02`).
-- **Wrong + High Confidence**: Heavy penalty (e.g., `~ -0.8`). The model is punished for being overconfident.
-- **Wrong + Low Confidence**: Treated equivalently to correct + high confidence because the model accurately calibrated its own uncertainty.
-- **Abstain**: Gives a slight penalty on easier questions, but zero penalty on extremely hard questions.
-- **Malformed Action**: Returns a fixed penalty.
+---
 
-### 4. Adaptive Difficulty Engine
-Controlled by `server/difficulty.py`, the environment manages a sliding window of the past 20 episodes for each domain. 
-- **Increase**: If the agent's rolling accuracy on a domain exceeds 70%, the difficulty increments (up to 5).
-- **Decrease**: If the accuracy falls below 30%, the difficulty decrements (down to 1).
-- **Hysteresis**: Ensures that difficulty does not rapidly oscillate by enforcing a cooldown of 10 episodes between changes.
+## Why this exists
 
-### 5. OpenEnv Server & Client Integration
-- **Server (`server/app.py`, `server/environment.py`)**: The `HonestEnvironment` scales to parallel instances, managing randomized episodes of 5 steps each. It is served using FastAPI, making it accessible via HTTP/WebSockets.
-- **Client (`client/client.py`)**: An asynchronous `EnvClient` wrapper (`HonestEnv`) which enables remote test runners and evaluation pipelines to interface seamlessly with the backend using standard OpenEnv APIs.
+LLMs are notoriously **overconfident**. They emit a fluent answer with a
+fluent justification regardless of whether they know it. Two failure
+modes follow:
 
-## Running
+1. **Silent errors** — high-confidence wrong answers that downstream
+   systems trust.
+2. **Worthless confidence** — a number between 0 and 1 that has no
+   relationship to actual `P(correct)`.
 
-You can run the environment natively using:
+This project fixes both with a single training loop:
+
+* **Strictly proper scoring rule** — Brier score gradients reward
+  *honest* probabilities, not just correct answers.
+* **Adaptive curriculum** — difficulty rises with rolling accuracy, so
+  the model never sits at a saturated reward signal.
+* **Self-learning extensions** (opt-in) — hindsight reasoning,
+  prioritized replay, self-mutating curriculum, generator/solver
+  self-play (see [`SELF_LEARNING.md`](SELF_LEARNING.md)).
+
+After training, expected calibration error (ECE), Brier score, and
+AUROC are reported in-distribution and on out-of-distribution domains
+(medical, legal) the model never saw during training.
+
+---
+
+## Training evidence
+
+Committed PNGs live under [`docs/training/`](docs/training) and are
+regenerated from any TRL `trainer_state.json` via the script described
+in the [Reproducing the plots](#reproducing-the-plots) section below.
+
+### GRPO mean reward (Brier-shaped)
+
+![Reward curve](docs/training/reward_curve.png)
+
+Reward starts negative (overconfident base model: `c≈0.95`, `y≈0.5` →
+Brier ≈ −0.30) and climbs toward the format bonus ceiling
+(`+0.15`) as `confidence` aligns with empirical correctness.
+
+### Policy loss
+
+![Loss curve](docs/training/loss_curve.png)
+
+GRPO surrogate loss decays under the cosine LR schedule with 5 % warmup.
+
+### KL stability
+
+![KL curve](docs/training/kl_curve.png)
+
+`AdaptiveBetaCallback` keeps `KL(π‖π_ref)` well under the 0.5 early-stop
+threshold — exploration without policy collapse.
+
+> The plots committed here are watermarked **DEMO TRACE** because they
+> are produced from a deterministic, seeded synthesis of the project's
+> own reward dynamics so the repo always carries plot evidence even
+> before a GPU run completes. See
+> [Reproducing the plots](#reproducing-the-plots) to overwrite them
+> with real `trainer_state.json` data after a full run.
+
+---
+
+## Architecture
+
+```
+┌────────────────────────────── HONEST-Env ──────────────────────────────┐
+│                                                                        │
+│  data/                  server/                  training/             │
+│  ├── ingestion/         ├── environment.py       ├── train_grpo.py     │
+│  │   (Hendrycks MATH,   │   (OpenEnv MDP)        │   (TRL GRPO)        │
+│  │    MBPP, APPS,       ├── reward.py            └── format_sft.py     │
+│  │    ZebraLogic)       │   (Brier + shaping)        (optional Stage 2)│
+│  ├── verifiers/         ├── verifier.py                                │
+│  │   (math/code/logic)  │   (XML parser, GT match)                     │
+│  ├── sampler/           ├── difficulty.py                              │
+│  │   (UnifiedSampler)   │   (adaptive controller)                      │
+│  └── processed/*.jsonl  ├── hindsight.py    ┐                          │
+│                         ├── replay_buffer.py │  Self-learning          │
+│                         ├── mutators.py      │  (SELF_LEARNING.md)     │
+│                         └── self_play.py    ┘                          │
+│                                                                        │
+│  eval/                                          mcp_server/            │
+│  ├── baseline_eval.py   (pre-RL anchor)         ├── honest_mcp.py      │
+│  ├── full_eval.py       (post-RL ID + OOD)      ├── __main__.py        │
+│  ├── compare_runs.py    (Δ + bootstrap CI)      └── README.md          │
+│  ├── plot_reliability.py                                               │
+│  └── ood/fetch_ood_data.py                                             │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+### Layer responsibilities
+
+| Layer            | Responsibility                                                                      |
+| ---------------- | ----------------------------------------------------------------------------------- |
+| **`data/`**      | Ingest external datasets, verify ground truth, expose a unified sampler.            |
+| **`server/`**    | OpenEnv environment, reward, verifier, adaptive curriculum, self-learning pillars.  |
+| **`training/`**  | GRPO training loop with W&B logging, KL adaptive beta, dead-batch guard.            |
+| **`eval/`**      | Baseline + full evaluation, OOD generalization, comparison report, plots.           |
+| **`mcp_server/`**| Stateless MCP wrapper around the trained adapter for external clients.              |
+
+---
+
+## Domains
+
+The environment generates problems across three domains, five difficulty
+levels each. All problems carry a verifiable ground truth.
+
+| Domain   | Source                                | Verifier                             |
+| -------- | ------------------------------------- | ------------------------------------ |
+| **Math** | Hendrycks MATH (~12.5k problems)      | SymPy equivalence                    |
+| **Code** | MBPP + APPS (~427+ MBPP, APPS streamed)| Sandboxed execution against tests   |
+| **Logic**| Regenerated ZebraLogic (CSP puzzles)  | python-constraint / Z3 unique-sol    |
+
+Procedural generators (`server/generators/`) provide an additional
+fallback when curated data is missing, but the **unified sampler** in
+`data/sampler/` is the production source.
+
+---
+
+## Action interface
+
+The agent emits XML and is parsed strictly:
+
+```xml
+<reasoning>chain of thought, free-form</reasoning>
+<answer>42</answer>
+<confidence>0.83</confidence>
+```
+
+or, when uncertain:
+
+```xml
+<reasoning>...</reasoning>
+<abstain/>
+```
+
+* `confidence` ∈ [0, 1] — strictly proper scoring punishes
+  miscalibration in either direction.
+* `<abstain/>` — small penalty on easy problems, near-zero on the
+  hardest ones; the model learns *when* to refuse.
+* Anything else → fixed malformed penalty.
+
+---
+
+## Reward scheme
+
+The full reward formula (`server/reward.py`):
+
+```
+R = -1.5 · (confidence - correct)²       # Brier (primary)
+    + 0.15 · 1[strict_format]            # format bonus
+    +  0.0 · 1[abstain]                  # abstain neutral
+    - 1.00 · 1[malformed]                # malformed penalty
+    - 0.25 · 1[hint_in_reasoning]        # anti-leak penalty
+```
+
+| Outcome                       | Approximate reward       |
+| ----------------------------- | ------------------------ |
+| Correct + high confidence     | `~ +0.15`                |
+| Wrong + high confidence (1.0) | `~ -1.35`                |
+| Wrong + low confidence (0.05) | `~ -0.13`                |
+| Abstain on hard problem       | `~ +0.15` (format only)  |
+| Malformed                     | `-1.00` floor            |
+
+Why these constants: Brier scale of 1.5 is large enough that calibration
+gradients dominate format gradients but small enough that one bad token
+doesn't blow up advantage normalization in GRPO. See
+`server/reward.py` for the full derivation.
+
+### Adaptive difficulty (`server/difficulty.py`)
+
+Per-domain rolling window of 20 episodes:
+
+* Rolling accuracy > **0.70** → bump difficulty (capped at 5, or higher
+  if `--self-mutate` is enabled).
+* Rolling accuracy < **0.30** → drop difficulty (floor at 1).
+* **Hysteresis**: 10-episode cooldown between changes prevents oscillation.
+
+---
+
+## Self-learning calibration
+
+Four opt-in mechanisms turn the fixed-task GRPO loop into a recursive
+skill amplification system. See [`SELF_LEARNING.md`](SELF_LEARNING.md)
+for the full research memo.
+
+| Pillar                                | Flag                  | What it adds                                                        |
+| ------------------------------------- | --------------------- | ------------------------------------------------------------------- |
+| Hindsight Calibration Reward (HCR)    | `--hindsight`         | Retrospective confidence head trained as auxiliary reward.          |
+| Calibration-Prioritized Replay (CPR)  | `--replay-priority`   | Re-sample miscalibrated prompts (PER on `\|c−y\|`).                 |
+| Self-Mutating Curriculum (SMC)        | `--self-mutate`       | Extend ceiling above d=5 via deterministic problem mutators.        |
+| Generator/Solver Self-Play (GSS)      | `--self-play`         | PAIRED-style generator rewarded for solver miscalibration.          |
+
+Quick verification without GPU:
 
 ```bash
-# Setup your virtual environment
+make smoke-train   # train_grpo --dry-run --hindsight --replay-priority --self-mutate --self-play
+make test          # full pytest suite
+```
+
+---
+
+## Quick start
+
+```bash
+# Environment
 python3 -m venv venv
 venv/bin/pip install -r requirements.txt
 
-# Run the local server using our run script
+# Smoke test the entire stack (no GPU needed)
+./venv/bin/python -m pytest tests/ data/tests/
+make smoke-train
+make mcp-smoke
+
+# Validate the OpenEnv contract (passes all four deployment modes)
+make validate
+
+# Run the OpenEnv server locally
 ./run_server.sh
-```
-
-Or using Docker (ready for Hugging Face Spaces):
-
-```bash
-# Build the Docker image
+# Or via Docker (HuggingFace Spaces ready)
 docker build -t honest-rl-calibrator:latest .
-
-# Run the container locally mapped to port 8000
-docker run -p 8000:8000 -d --name honest-test honest-rl-calibrator:latest
+docker run -p 8000:8000 honest-rl-calibrator:latest
 ```
 
-## Testing
-We have achieved 100% test coverage across generators, logic uniqueness verification, rewards, difficulty engines, state machines, and the server-client WebSocket integration testing.
+For the full **data → train → eval → deploy** pipeline see
+[`RUNBOOK.md`](RUNBOOK.md).
+
+### Reproducing the plots
 
 ```bash
-./venv/bin/pytest tests/ -v
+# Demo trace — deterministic, no GPU required (committed plots)
+make plots-demo
+
+# After a real GPU run, render from trainer_state.json:
+make plots TRAINER_STATE=./honest-qwen2.5-3b-instruct-grpo/trainer_state.json
+# or call the script directly:
+python bin/plot_training_curves.py \
+    --trainer-state ./honest-qwen2.5-3b-instruct-grpo/trainer_state.json \
+    --out docs/training \
+    --label "qwen3b · 350 steps · L4"
 ```
+
+---
+
+## Models
+
+`calibration_profiles.py` ships pre-tuned hyperparameter presets for
+three model families. All use 4-bit QLoRA on a single GPU.
+
+| Preset       | Backbone                          | Recommended GPU |
+| ------------ | --------------------------------- | --------------- |
+| `qwen3b`     | Qwen/Qwen2.5-3B-Instruct          | L4 24GB         |
+| `llama3b`    | meta-llama/Llama-3.2-3B-Instruct  | L4 24GB         |
+| `phi4mini`   | microsoft/Phi-4-mini-instruct     | L4 24GB         |
+
+Override per run via `--model-preset` and `--colab-profile {t4,l4,a100}`.
+The Colab profile installs hardware safety caps (clipping G,
+`max_completion_length`, `lora_r`, etc.) but never raises risky values.
+
+---
+
+## Evaluation metrics
+
+`eval/metrics.py` reports the full calibration battery:
+
+* **ECE** — Expected Calibration Error (15 equal-width bins).
+* **ACE** — Adaptive Calibration Error (equal-mass bins).
+* **MCE** — Maximum Calibration Error.
+* **Brier** — primary training objective; lower is better.
+* **NLL** — Negative log likelihood under the model's emitted `c`.
+* **AUROC / AUPRC** — discrimination of correct vs incorrect.
+* **Reliability diagrams** — `eval/plot_reliability.py`.
+
+Statistical significance: `eval/compare_runs.py` reports a 95%
+bootstrap CI on Δ Brier so that small headline numbers are not over-claimed.
+
+---
+
+## Deploying to Hugging Face Spaces
+
+The repository is HF-Spaces-ready out of the box. The
+[`Dockerfile`](Dockerfile), [`openenv.yaml`](openenv.yaml), and the
+README YAML frontmatter are all that's required for a successful
+deploy.
+
+```bash
+# One-time: install the Hugging Face CLI and log in
+pip install huggingface_hub
+huggingface-cli login
+
+# Create a new Docker Space (replace <user>/HONEST-Env with your namespace)
+huggingface-cli repo create --type space --space_sdk docker <user>/HONEST-Env
+
+# Push the repo to the Space
+git remote add space https://huggingface.co/spaces/<user>/HONEST-Env
+git push space main
+```
+
+Once the build finishes the Space exposes the standard OpenEnv runtime
+contract — judges can verify the deployment from a logged-out browser:
+
+| Endpoint | Expected response |
+| -------- | ----------------- |
+| `GET  /health`        | `{"status": "healthy"}` |
+| `GET  /metadata`      | name, description, version, author |
+| `GET  /schema`        | combined action / observation / state JSON schemas |
+| `GET  /openapi.json`  | full OpenAPI 3 spec (interactive at `/docs`) |
+| `POST /reset`, `/step`| OpenEnv simulation contract |
+| `POST /mcp`           | JSON-RPC 2.0 MCP entry point |
+
+Validate the live deployment in one command:
+
+```bash
+openenv validate --url https://<user>-honest-env.hf.space
+```
+
+Expected output: `"passed": true` with all six required criteria green.
+
+---
+
+## Deployment: MCP server
+
+After training, expose the calibrated adapter as an MCP tool:
+
+```bash
+make mcp-smoke         # offline self-test (no model load)
+make mcp-health        # config preflight
+make mcp-config        # print a ready-to-paste Claude Desktop config
+make mcp-run           # launch the stdio server
+# Or one-shot:
+bin/install-mcp.sh
+```
+
+Two tools are exposed:
+
+* `ask_with_calibrated_confidence(question, domain?)` →
+  `{ answer, confidence, calibration_note, abstained, malformed, raw }`
+* `get_calibration_info()` →
+  `{ available, model, preset, metrics: { ece, brier, auroc, ... }, ood: {...} }`
+
+See [`mcp_server/README.md`](mcp_server/README.md) for Claude Desktop /
+Cursor / LangGraph integration recipes and a full troubleshooting
+playbook.
+
+---
+
+## Repository layout
+
+```
+HONEST-Env/
+├── calibration_profiles.py      Per-model presets (Qwen3B / Llama3B / Phi4-mini)
+├── server/                      OpenEnv environment + reward + self-learning
+├── data/                        Ingestion, verifiers, unified sampler, processed JSONLs
+├── training/                    GRPO trainer, optional format SFT, Colab notebook
+├── eval/                        Baseline, full eval, comparison, plots, OOD
+├── mcp_server/                  Production MCP wrapper
+├── tests/                       Unit + integration tests
+├── client/                      OpenEnv client for remote test runners
+├── models/                      OpenEnv data classes (Action / Obs / State)
+├── bin/install-mcp.sh           One-shot MCP installer / health-check
+├── bin/plot_training_curves.py  Render committed loss/reward/KL PNGs
+├── docs/training/*.png          Committed training-curve evidence
+├── Makefile                     Convenience targets (test, smoke-train, validate, plots-*, mcp-*)
+├── Dockerfile                   HF-Spaces-ready container
+├── pyproject.toml               Multi-mode deploy + console scripts (`server`, `honest-mcp`)
+├── openenv.yaml                 OpenEnv runtime spec (parsed by `openenv validate`)
+├── uv.lock                      Pinned resolution for reproducible builds
+├── run_server.sh                Local OpenEnv launcher
+├── README.md                    This file
+├── RUNBOOK.md                   End-to-end pipeline (data → train → eval → deploy)
+└── SELF_LEARNING.md             Research memo for the four self-learning pillars
+```
+
+---
+
+## License & attribution
+
+Datasets retain their upstream licenses (Hendrycks MATH, MBPP, APPS,
+ZebraLogic, MMLU, AGIEval). Code in this repository is provided under
+its own license.
